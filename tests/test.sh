@@ -161,7 +161,10 @@ systemctl() {
     case "${1-}" in
         is-active)
             [[ "$*" == "is-active --quiet caddy" ]] || return 99
-            [[ "$MOCK_ACTIVE" == "true" ]]
+            if [[ "$MOCK_ACTIVE" == "true" ]]; then
+                return 0
+            fi
+            return 1
             ;;
         show)
             if [[ "$*" == "show -p MainPID --value caddy" ]]; then
@@ -177,6 +180,7 @@ systemctl() {
             else
                 return 99
             fi
+            return 0
             ;;
         restart)
             [[ "$*" == "restart caddy" ]] || return 99
