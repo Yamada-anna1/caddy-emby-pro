@@ -65,7 +65,7 @@ register_shortcut() {
 install_base() {
     log "正在检查基础组件..."
 
-    local packages=("curl" "wget" "sudo" "socat" "net-tools" "psmisc" "sed" "grep" "gawk" "coreutils" "util-linux")
+    local packages=("curl" "wget" "sudo" "socat" "net-tools" "psmisc" "sed" "grep" "gawk" "jq" "coreutils" "util-linux")
     local to_install=()
     local pkg
 
@@ -176,104 +176,534 @@ valid_menu_choice() {
 
 
 ensure_caddy_dir() {
-    mkdir -p "$CADDY_DIR"
+    mkdir -p "$(dirname -- "$CADDYFILE")"
 }
 
 
 new_candidate_file() {
-    ensure_caddy_dir
-    mktemp "$CADDY_DIR/.Caddyfile.candidate.XXXXXX"
+    local candidate config_dir
+
+    if ! ensure_caddy_dir; then
+        error "无法创建 Caddy 配置目录：$(dirname -- "$CADDYFILE")"
+        return 1
+    fi
+    config_dir="$(dirname -- "$CADDYFILE")"
+    if ! candidate="$(mktemp "$config_dir/.Caddyfile.candidate.XXXXXX")"; then
+        error "无法创建 Caddy 候选配置文件"
+        return 1
+    fi
+    printf '%s\n' "$candidate"
 }
 
 
 backup_current_config() {
-    local backup_count
+    local expected_sha="${1-}"
+    local temporary_backup final_backup stamp unique_part
+    local source_sha backup_sha transaction_sha
     LAST_BACKUP=""
 
-    mkdir -p "$BACKUP_DIR"
-    chmod 700 "$BACKUP_DIR"
-
-    if [[ -f "$CADDYFILE" ]]; then
-        LAST_BACKUP="$BACKUP_DIR/Caddyfile.$(date +%F_%H%M%S).bak"
-        cp -a "$CADDYFILE" "$LAST_BACKUP"
+    if [[ -L "$CADDYFILE" ]]; then
+        error "Caddyfile 不是普通文件，拒绝自动覆盖"
+        return 1
+    fi
+    if [[ ! -e "$CADDYFILE" ]]; then
+        [[ -z "$expected_sha" ]] && return 0
+        error "需要备份的 Caddyfile 已不存在，正式配置未修改"
+        return 1
+    fi
+    if [[ ! -f "$CADDYFILE" ]]; then
+        error "Caddyfile 不是普通文件，拒绝自动覆盖"
+        return 1
     fi
 
-    backup_count="$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'Caddyfile.*.bak' 2>/dev/null | wc -l)"
-    if (( backup_count > 5 )); then
-        find "$BACKUP_DIR" -maxdepth 1 -type f -name 'Caddyfile.*.bak' -printf '%T@ %p\n' 2>/dev/null \
-            | sort -nr \
-            | tail -n +6 \
-            | cut -d' ' -f2- \
-            | xargs -r rm -f
+    source_sha="$(config_sha256 "$CADDYFILE")" || {
+        error "无法校验待备份的 Caddyfile"
+        return 1
+    }
+    if [[ -n "$expected_sha" && "$source_sha" != "$expected_sha" ]]; then
+        error "Caddyfile 在备份前发生变化，已拒绝继续"
+        return 1
+    fi
+    transaction_sha="${expected_sha:-$source_sha}"
+
+    if ! install -d -m 700 -- "$BACKUP_DIR"; then
+        error "无法创建安全备份目录：$BACKUP_DIR"
+        return 1
+    fi
+
+    if ! temporary_backup="$(mktemp "$BACKUP_DIR/.Caddyfile.backup.XXXXXX")"; then
+        error "无法创建临时备份文件"
+        return 1
+    fi
+    if ! cp -a -- "$CADDYFILE" "$temporary_backup" \
+        || ! cmp -s -- "$CADDYFILE" "$temporary_backup"; then
+        rm -f -- "$temporary_backup"
+        error "Caddyfile 备份或备份校验失败，正式配置未修改"
+        return 1
+    fi
+    backup_sha="$(config_sha256 "$temporary_backup")" || backup_sha=""
+    if [[ "$backup_sha" != "$source_sha" ]]; then
+        rm -f -- "$temporary_backup"
+        error "Caddyfile 临时备份校验值不一致，正式配置未修改"
+        return 1
+    fi
+
+    stamp="$(date +%Y%m%d-%H%M%S-%N)"
+    unique_part="${temporary_backup##*.backup.}"
+    final_backup="$BACKUP_DIR/Caddyfile.${stamp}.${unique_part}.bak"
+    if ! mv -fT -- "$temporary_backup" "$final_backup" \
+        || ! cmp -s -- "$CADDYFILE" "$final_backup"; then
+        rm -f -- "$temporary_backup" "$final_backup"
+        error "Caddyfile 最终备份校验失败，正式配置未修改"
+        return 1
+    fi
+    backup_sha="$(config_sha256 "$final_backup")" || backup_sha=""
+    source_sha="$(config_sha256 "$CADDYFILE")" || source_sha=""
+    if [[ "$backup_sha" != "$transaction_sha" || "$source_sha" != "$transaction_sha" ]]; then
+        rm -f -- "$final_backup"
+        error "Caddyfile 最终备份与事务起始版本不一致，正式配置未修改"
+        return 1
+    fi
+
+    LAST_BACKUP="$final_backup"
+    return 0
+}
+
+
+prune_old_backups() {
+    local list_file sorted_file backup_name
+    local keep_limit=5 kept=0
+    local cleanup_failed=false removed_any=false current_present=false
+    local -a backups=()
+
+    [[ -d "$BACKUP_DIR" ]] || return 0
+    list_file="$(mktemp)" || {
+        warn "无法创建备份清单，已保留全部备份文件"
+        return 0
+    }
+    sorted_file="$(mktemp)" || {
+        rm -f -- "$list_file"
+        warn "无法创建备份排序清单，已保留全部备份文件"
+        return 0
+    }
+
+    if ! find "$BACKUP_DIR" -maxdepth 1 -type f -name 'Caddyfile.*.bak' -printf '%f\n' > "$list_file" \
+        || ! sort -r "$list_file" > "$sorted_file"; then
+        rm -f -- "$list_file" "$sorted_file"
+        warn "无法统计旧备份，已保留全部备份文件"
+        return 0
+    fi
+    mapfile -t backups < "$sorted_file"
+    rm -f -- "$list_file" "$sorted_file"
+
+    for backup_name in "${backups[@]}"; do
+        if [[ -n "$LAST_BACKUP" && "$backup_name" == "${LAST_BACKUP##*/}" ]]; then
+            current_present=true
+            break
+        fi
+    done
+    if [[ "$current_present" == "true" ]]; then
+        keep_limit=4
+    fi
+
+    for backup_name in "${backups[@]}"; do
+        if [[ "$current_present" == "true" && "$backup_name" == "${LAST_BACKUP##*/}" ]]; then
+            continue
+        fi
+        if (( kept < keep_limit )); then
+            kept=$((kept + 1))
+            continue
+        fi
+        if ! rm -f -- "$BACKUP_DIR/$backup_name"; then
+            cleanup_failed=true
+        else
+            removed_any=true
+        fi
+    done
+
+    if [[ "$cleanup_failed" == "true" ]]; then
+        warn "部分旧备份清理失败，未影响本次配置写入"
+    elif [[ "$removed_any" == "true" ]]; then
         log "已清理旧备份文件"
     fi
 }
 
 
-has_site_blocks() {
+caddyfile_has_effective_content() {
     local file="$1"
-    grep -Eq '^[a-zA-Z0-9.-]+([[:space:]]*,[[:space:]]*[a-zA-Z0-9.-]+)*[[:space:]]*\{' "$file"
+    local status
+
+    [[ -f "$file" && -r "$file" ]] || return 2
+    if awk '
+        {
+            line=$0
+            sub(/^[[:space:]]+/, "", line)
+            if (line != "" && line !~ /^#/) found=1
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$file"; then
+        status=0
+    else
+        status=$?
+    fi
+    case "$status" in
+        0|1) return "$status" ;;
+        *)   return 2 ;;
+    esac
+}
+
+
+adapt_caddyfile_to_json() {
+    local file="$1"
+    local output_file="$2"
+    local content_status
+
+    if caddyfile_has_effective_content "$file"; then
+        caddy adapt --config "$file" --adapter caddyfile > "$output_file"
+        return $?
+    else
+        content_status=$?
+    fi
+    if (( content_status == 1 )); then
+        printf '{}\n' > "$output_file"
+        return $?
+    fi
+    return 2
+}
+
+
+adapted_json_requires_caddy() {
+    local json_file="$1"
+    jq -e '((.apps? // {}) | length) > 0' "$json_file" >/dev/null
+}
+
+
+config_sha256() {
+    local output
+    output="$(sha256sum -- "$1")" || return 1
+    printf '%s\n' "${output%% *}"
+}
+
+
+caddy_main_pid() {
+    systemctl show -p MainPID --value caddy 2>/dev/null
+}
+
+
+caddy_active_state() {
+    systemctl show -p ActiveState --value caddy 2>/dev/null
+}
+
+
+caddy_service_is_healthy() {
+    local pid
+
+    systemctl is-active --quiet caddy || return 1
+    pid="$(caddy_main_pid)" || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]]
+}
+
+
+caddy_service_is_stopped() {
+    local state
+
+    state="$(systemctl show -p ActiveState --value caddy 2>/dev/null)" || return 1
+    [[ "$state" == "inactive" || "$state" == "failed" ]]
+}
+
+
+apply_caddy_runtime_state() {
+    local desired_has_sites="$1"
+    local was_active="$2"
+    local old_pid="$3"
+    local new_pid
+
+    if [[ "$desired_has_sites" == "true" ]]; then
+        systemctl restart caddy || return 1
+        caddy_service_is_healthy || return 1
+        new_pid="$(caddy_main_pid)" || return 1
+        if [[ "$was_active" == "true" && "$new_pid" == "$old_pid" ]]; then
+            return 1
+        fi
+        return 0
+    fi
+
+    systemctl stop caddy || return 1
+    caddy_service_is_stopped
+}
+
+
+restore_config_atomic() {
+    local previous_exists="$1"
+    local backup_file="$2"
+    local rollback_file config_dir
+
+    if [[ "$previous_exists" == "true" ]]; then
+        [[ -f "$backup_file" ]] || return 1
+        config_dir="$(dirname -- "$CADDYFILE")"
+        rollback_file="$(mktemp "$config_dir/.Caddyfile.rollback.XXXXXX")" || return 1
+        if ! cp -a -- "$backup_file" "$rollback_file" \
+            || ! cmp -s -- "$backup_file" "$rollback_file"; then
+            rm -f -- "$rollback_file"
+            return 1
+        fi
+        if ! mv -fT -- "$rollback_file" "$CADDYFILE" \
+            || ! cmp -s -- "$backup_file" "$CADDYFILE"; then
+            rm -f -- "$rollback_file"
+            return 1
+        fi
+        return 0
+    fi
+
+    rm -f -- "$CADDYFILE" || return 1
+    [[ ! -e "$CADDYFILE" ]]
+}
+
+
+restore_caddy_service_state() {
+    local was_active="$1"
+
+    if [[ "$was_active" == "true" ]]; then
+        systemctl restart caddy || return 1
+        caddy_service_is_healthy
+        return $?
+    fi
+
+    systemctl stop caddy || return 1
+    caddy_service_is_stopped
+}
+
+
+rollback_applied_candidate() {
+    local previous_exists="$1"
+    local was_active="$2"
+    local expected_candidate_sha="$3"
+    local current_sha
+
+    if [[ -L "$CADDYFILE" || ! -f "$CADDYFILE" ]]; then
+        error "严重：准备回滚时 Caddyfile 已被外部改变；为避免覆盖新内容，未自动回滚。旧备份：${LAST_BACKUP:-无}"
+        return 2
+    fi
+    current_sha="$(config_sha256 "$CADDYFILE")" || current_sha=""
+    if [[ -z "$current_sha" || "$current_sha" != "$expected_candidate_sha" ]]; then
+        error "严重：准备回滚时检测到 Caddyfile 已被其他进程修改；为避免覆盖外部修改，未自动回滚。旧备份：${LAST_BACKUP:-无}"
+        return 2
+    fi
+
+    if ! restore_config_atomic "$previous_exists" "$LAST_BACKUP"; then
+        error "严重：新配置应用失败，并且磁盘配置回滚失败；备份保留在：${LAST_BACKUP:-无}"
+        return 2
+    fi
+    if ! restore_caddy_service_state "$was_active"; then
+        error "严重：磁盘配置已恢复，但 Caddy 服务状态恢复失败；备份：${LAST_BACKUP:-无}"
+        return 2
+    fi
+
+    error "新配置未生效；旧配置和原服务状态已成功恢复"
+    return 1
 }
 
 
 apply_candidate() {
     local candidate="$1"
     local previous_exists=false
+    local was_active=false
+    local desired_should_run=false
+    local adapted_json route_status
+    local before_sha="" current_sha candidate_sha installed_sha
+    local old_pid="" apply_status service_state
+    local config_dir candidate_device config_device
 
-    if has_site_blocks "$candidate"; then
+    if [[ ! -f "$candidate" || -L "$candidate" ]]; then
+        error "候选配置不是普通文件，已停止操作"
+        rm -f -- "$candidate"
+        return 1
+    fi
+    config_dir="$(dirname -- "$CADDYFILE")"
+    candidate_device="$(stat -c %d -- "$candidate")" || candidate_device=""
+    config_device="$(stat -c %d -- "$config_dir")" || config_device=""
+    if [[ -z "$candidate_device" || "$candidate_device" != "$config_device" ]]; then
+        error "候选配置与正式配置目录不在同一文件系统，拒绝非原子替换"
+        rm -f -- "$candidate"
+        return 1
+    fi
+
+    if caddyfile_has_effective_content "$candidate"; then
         if ! caddy fmt --overwrite "$candidate"; then
             error "Caddy 格式化失败，正式配置未修改"
-            rm -f "$candidate"
+            rm -f -- "$candidate"
             return 1
         fi
 
         if ! caddy validate --config "$candidate" --adapter caddyfile; then
             error "Caddy 配置验证失败，正式配置未修改"
-            rm -f "$candidate"
+            rm -f -- "$candidate"
             return 1
         fi
     fi
 
-    [[ -f "$CADDYFILE" ]] && previous_exists=true
-    backup_current_config
-    if [[ -f "$CADDYFILE" ]]; then
-        chown --reference="$CADDYFILE" "$candidate" 2>/dev/null || true
-        chmod --reference="$CADDYFILE" "$candidate" 2>/dev/null || chmod 644 "$candidate"
+    adapted_json="$(mktemp)" || {
+        error "无法创建 Caddy 解析结果临时文件"
+        rm -f -- "$candidate"
+        return 1
+    }
+    if ! adapt_caddyfile_to_json "$candidate" "$adapted_json"; then
+        error "无法解析候选 Caddy 配置，正式配置未修改"
+        rm -f -- "$candidate" "$adapted_json"
+        return 1
+    fi
+    if adapted_json_requires_caddy "$adapted_json"; then
+        desired_should_run=true
     else
-        chmod 644 "$candidate"
+        route_status=$?
+        if (( route_status != 1 )); then
+            error "无法检查候选配置是否仍需运行 Caddy，正式配置未修改"
+            rm -f -- "$candidate" "$adapted_json"
+            return 1
+        fi
     fi
-    mv -f "$candidate" "$CADDYFILE"
+    rm -f -- "$adapted_json"
 
-    if ! has_site_blocks "$CADDYFILE"; then
-        systemctl stop caddy 2>/dev/null || true
-        warn "已删除最后一个站点，Caddyfile 已清空并停止 Caddy"
-        return 0
+    candidate_sha="$(config_sha256 "$candidate")" || {
+        error "无法计算候选配置校验值"
+        rm -f -- "$candidate"
+        return 1
+    }
+
+    if [[ -L "$CADDYFILE" ]]; then
+        error "Caddyfile 是符号链接，拒绝自动覆盖"
+        rm -f -- "$candidate"
+        return 1
+    fi
+    if [[ -e "$CADDYFILE" ]]; then
+        if [[ ! -f "$CADDYFILE" ]]; then
+            error "Caddyfile 不是普通文件，拒绝自动覆盖"
+            rm -f -- "$candidate"
+            return 1
+        fi
+        previous_exists=true
+        before_sha="$(config_sha256 "$CADDYFILE")" || {
+            error "无法计算原 Caddyfile 校验值"
+            rm -f -- "$candidate"
+            return 1
+        }
     fi
 
-    log "正在重启 Caddy..."
-    systemctl restart caddy
-    sleep 2
+    service_state="$(caddy_active_state)" || {
+        error "无法读取 Caddy 服务状态，已停止操作"
+        rm -f -- "$candidate"
+        return 1
+    }
+    case "$service_state" in
+        active)
+            was_active=true
+            if [[ "$previous_exists" != "true" ]]; then
+                error "Caddy 正在运行但 Caddyfile 不存在，无法保证安全回滚"
+                rm -f -- "$candidate"
+                return 1
+            fi
+            old_pid="$(caddy_main_pid)" || {
+                error "无法读取 Caddy 主进程 PID，已停止操作"
+                rm -f -- "$candidate"
+                return 1
+            }
+            if [[ ! "$old_pid" =~ ^[1-9][0-9]*$ ]]; then
+                error "Caddy 服务状态异常，已停止操作"
+                rm -f -- "$candidate"
+                return 1
+            fi
+            ;;
+        inactive|failed)
+            ;;
+        *)
+            error "Caddy 服务处于无法安全修改的状态：${service_state:-未知}"
+            rm -f -- "$candidate"
+            return 1
+            ;;
+    esac
 
-    if systemctl is-active --quiet caddy; then
+    if ! backup_current_config "$before_sha"; then
+        rm -f -- "$candidate"
+        return 1
+    fi
+
+    if [[ "$previous_exists" == "true" ]]; then
+        current_sha="$(config_sha256 "$CADDYFILE")" || {
+            error "无法再次校验原 Caddyfile，已停止操作"
+            rm -f -- "$candidate"
+            return 1
+        }
+        if [[ "$current_sha" != "$before_sha" ]]; then
+            error "检测到 Caddyfile 在操作期间被其他进程修改，已拒绝覆盖"
+            rm -f -- "$candidate"
+            return 1
+        fi
+
+        if ! chown --reference="$CADDYFILE" "$candidate" \
+            || ! chmod --reference="$CADDYFILE" "$candidate"; then
+            error "无法复制原 Caddyfile 的所有者或权限，正式配置未修改"
+            rm -f -- "$candidate"
+            return 1
+        fi
+        if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then
+            if ! chcon --reference="$CADDYFILE" "$candidate"; then
+                error "无法复制 Caddyfile 的 SELinux 上下文，正式配置未修改"
+                rm -f -- "$candidate"
+                return 1
+            fi
+        fi
+    else
+        if [[ -e "$CADDYFILE" || -L "$CADDYFILE" ]]; then
+            error "检测到 Caddyfile 在操作期间被创建，已拒绝覆盖"
+            rm -f -- "$candidate"
+            return 1
+        fi
+        if ! chmod 0644 "$candidate"; then
+            error "无法设置候选配置权限，正式配置未修改"
+            rm -f -- "$candidate"
+            return 1
+        fi
+    fi
+
+    if [[ "$previous_exists" == "true" ]]; then
+        if ! mv -fT -- "$candidate" "$CADDYFILE"; then
+            error "无法原子替换 Caddyfile，正式配置未修改"
+            rm -f -- "$candidate"
+            return 1
+        fi
+    else
+        if ! mv -nT -- "$candidate" "$CADDYFILE" || [[ -e "$candidate" ]]; then
+            error "Caddyfile 在安装时已存在，未覆盖新出现的配置"
+            rm -f -- "$candidate"
+            return 1
+        fi
+    fi
+
+    installed_sha="$(config_sha256 "$CADDYFILE")" || installed_sha=""
+    if [[ "$installed_sha" != "$candidate_sha" ]]; then
+        error "正式配置写入校验失败，正在回滚"
+        rollback_applied_candidate "$previous_exists" "$was_active" "$candidate_sha"
+        return $?
+    fi
+
+    if apply_caddy_runtime_state "$desired_should_run" "$was_active" "$old_pid"; then
+        apply_status=0
+    else
+        apply_status=$?
+        error "Caddy 未能应用新配置（状态 $apply_status），正在回滚"
+        rollback_applied_candidate "$previous_exists" "$was_active" "$candidate_sha"
+        return $?
+    fi
+
+    prune_old_backups
+    if [[ "$desired_should_run" == "true" ]]; then
         echo -e "\n${GREEN}=========================================="
         echo -e " 操作成功！Caddy 运行中。"
         echo -e "==========================================${PLAIN}"
-        return 0
+    else
+        warn "已删除最后一个站点，Caddyfile 已清空并停止 Caddy"
     fi
-
-    error "Caddy 启动失败，正在恢复修改前的配置"
-    if [[ -n "$LAST_BACKUP" && -f "$LAST_BACKUP" ]]; then
-        local rollback
-        rollback="$(mktemp "$CADDY_DIR/.Caddyfile.rollback.XXXXXX")"
-        cp -a "$LAST_BACKUP" "$rollback"
-        mv -f "$rollback" "$CADDYFILE"
-        systemctl restart caddy 2>/dev/null || true
-    elif ! $previous_exists; then
-        rm -f "$CADDYFILE"
-        systemctl stop caddy 2>/dev/null || true
-    fi
-    error "已执行回滚，请查看：systemctl status caddy -l"
-    return 1
+    return 0
 }
 
 
@@ -355,9 +785,11 @@ remove_site_block_file() {
     awk -v target="$domain" '
         function opens(line, copy)  { copy=line; return gsub(/\{/, "", copy) }
         function closes(line, copy) { copy=line; return gsub(/\}/, "", copy) }
-        BEGIN { skipping=0; depth=0 }
+        BEGIN { skipping=0; depth=0; found=0; bad=0 }
         {
             if (!skipping && $0 == target " {") {
+                if (found) bad=1
+                found++
                 skipping=1
                 depth=opens($0)-closes($0)
                 next
@@ -372,7 +804,7 @@ remove_site_block_file() {
             print
         }
         END {
-            if (skipping) exit 42
+            if (skipping || found != 1 || bad) exit 42
         }
     ' "$source_file" > "$output_file"
 }
@@ -390,10 +822,103 @@ managed_site_exists() {
 }
 
 
-domain_block_exists_in_file() {
+exact_site_block_exists_in_file() {
     local file="$1"
     local domain="$2"
     grep -Fqx "$domain {" "$file"
+}
+
+
+adapted_json_contains_domain() {
+    local json_file="$1"
+    local domain="$2"
+    local target="${domain,,}"
+
+    target="${target%.}"
+    jq -e --arg target "$target" '
+        [
+            (.apps.http.servers? // {})[]?
+            | ..
+            | objects
+            | select((.match? | type) == "array")
+            | .match[]
+            | objects
+            | (.host? // [])
+            | .[]
+            | strings
+            | ascii_downcase
+        ]
+        | any(
+            . as $host
+            | $host == $target
+              or (($host | startswith("*.")) and ($target | endswith($host[1:])))
+        )
+    ' "$json_file" >/dev/null
+}
+
+
+domain_conflict_in_file() {
+    local file="$1"
+    local domain="$2"
+    local adapted_json error_file status content_status
+
+    if caddyfile_has_effective_content "$file"; then
+        :
+    else
+        content_status=$?
+        (( content_status == 1 )) && return 1
+        return 2
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        error "缺少 jq，无法可靠检查现有域名冲突"
+        return 2
+    fi
+
+    adapted_json="$(mktemp)" || return 2
+    error_file="$(mktemp)" || {
+        rm -f -- "$adapted_json"
+        return 2
+    }
+
+    if ! adapt_caddyfile_to_json "$file" "$adapted_json" 2> "$error_file"; then
+        error "Caddy 无法解析现有配置，拒绝在无法确认域名归属时自动修改"
+        sed -n '1,5p' "$error_file" >&2
+        rm -f -- "$adapted_json" "$error_file"
+        return 2
+    fi
+
+    if adapted_json_contains_domain "$adapted_json" "$domain"; then
+        status=0
+    else
+        status=$?
+    fi
+    rm -f -- "$adapted_json" "$error_file"
+
+    case "$status" in
+        0|1) return "$status" ;;
+        *)   return 2 ;;
+    esac
+}
+
+
+ensure_domain_available_in_file() {
+    local file="$1"
+    local domain="$2"
+    local label="$3"
+    local status
+
+    if domain_conflict_in_file "$file" "$domain"; then
+        error "$label $domain 已被现有 Caddy 配置使用，未做任何修改"
+        return 1
+    else
+        status=$?
+    fi
+
+    if (( status == 2 )); then
+        error "无法可靠检查 $label $domain，已拒绝自动修改"
+        return 1
+    fi
+    return 0
 }
 
 
@@ -450,7 +975,7 @@ $STREAM_BEGIN $front_domain $route_domain
         header_up Host {upstream_hostport}
         header_up -X-Forwarded-Host
 
-        header_down Location "(?i)^https?://${stream_regex}(?::[0-9]+)?" "https://${front_domain}/${stream_prefix}"
+        header_down Location "(?i)^https?://${stream_regex}(:[0-9]+)?/" "https://${front_domain}/${stream_prefix}/"
     }
 }
 
@@ -459,7 +984,7 @@ $STREAM_BEGIN $front_domain $route_domain
         header_up Host {upstream_hostport}
         header_up -X-Forwarded-Host
 
-        header_down Location "(?i)^https?://${stream_regex}(?::[0-9]+)?" "https://${front_domain}/${stream_prefix}"
+        header_down Location "(?i)^https?://${stream_regex}(:[0-9]+)?/" "https://${front_domain}/${stream_prefix}/"
     }
 }
 
@@ -493,9 +1018,21 @@ append_block_to_file() {
     local block="$2"
 
     if [[ -s "$file" ]]; then
-        printf '\n' >> "$file"
+        printf '\n' >> "$file" || return 1
     fi
     printf '%s\n' "$block" >> "$file"
+}
+
+
+copy_config_to_candidate() {
+    local source_file="$1"
+    local candidate="$2"
+
+    if ! cp -- "$source_file" "$candidate" \
+        || ! cmp -s -- "$source_file" "$candidate"; then
+        error "复制现有 Caddyfile 到候选配置失败，正式配置未修改"
+        return 1
+    fi
 }
 
 
@@ -599,6 +1136,7 @@ configure_caddy() {
         error "域名格式无效"
         return 1
     fi
+    domain="${domain,,}"
 
     read -r -p "请输入后端地址（例如 https://remote.example.com:443 或 127.0.0.1:8096）: " backend < /dev/tty
     [[ -z "$backend" ]] && backend="127.0.0.1:8096"
@@ -620,37 +1158,102 @@ configure_caddy() {
     read -r -p "确认写入？[y/N]: " confirm < /dev/tty
     [[ "$confirm" =~ ^[Yy]$ ]] || { warn "已取消"; return 0; }
 
-    candidate="$(new_candidate_file)"
+    if ! candidate="$(new_candidate_file)"; then
+        return 1
+    fi
     if [[ "$mode" == "append" && -f "$CADDYFILE" ]]; then
         if managed_site_exists "$domain"; then
             remove_managed_site_file "$CADDYFILE" "$candidate" "$domain" || {
                 error "旧配置标记不完整，已停止操作"
-                rm -f "$candidate"
+                rm -f -- "$candidate"
                 return 1
             }
-        elif domain_block_exists_in_file "$CADDYFILE" "$domain"; then
+        elif exact_site_block_exists_in_file "$CADDYFILE" "$domain"; then
             remove_site_block_file "$CADDYFILE" "$candidate" "$domain" || {
                 error "旧站点块结构异常，已停止操作"
-                rm -f "$candidate"
+                rm -f -- "$candidate"
                 return 1
             }
-        else
-            cp "$CADDYFILE" "$candidate"
+        elif ! copy_config_to_candidate "$CADDYFILE" "$candidate"; then
+            rm -f -- "$candidate"
+            return 1
         fi
-    else
-        : > "$candidate"
+    elif ! : > "$candidate"; then
+        error "无法初始化候选配置，正式配置未修改"
+        rm -f -- "$candidate"
+        return 1
+    fi
+
+    if ! ensure_domain_available_in_file "$candidate" "$domain" "访问域名"; then
+        rm -f -- "$candidate"
+        return 1
     fi
 
     config_block="$(build_standard_config_block "$domain" "$backend")"
-    append_block_to_file "$candidate" "$config_block"
+    if ! append_block_to_file "$candidate" "$config_block"; then
+        error "写入候选配置失败，正式配置未修改"
+        rm -f -- "$candidate"
+        return 1
+    fi
+    apply_candidate "$candidate"
+}
+
+
+commit_stream_proxy_config() {
+    local front_domain="$1"
+    local route_domain="$2"
+    local api_upstream="$3"
+    local stream_upstream="$4"
+    local stream_prefix="$5"
+    local site_id="$6"
+    local candidate config_block
+
+    if ! candidate="$(new_candidate_file)"; then
+        return 1
+    fi
+    if [[ -f "$CADDYFILE" ]]; then
+        if stream_group_exists "$front_domain"; then
+            remove_stream_group_file "$CADDYFILE" "$candidate" "$front_domain" || {
+                error "现有推流组标记不完整，已停止操作"
+                rm -f -- "$candidate"
+                return 1
+            }
+        elif ! copy_config_to_candidate "$CADDYFILE" "$candidate"; then
+            rm -f -- "$candidate"
+            return 1
+        fi
+    elif ! : > "$candidate"; then
+        error "无法初始化候选配置，正式配置未修改"
+        rm -f -- "$candidate"
+        return 1
+    fi
+
+    if ! ensure_domain_available_in_file "$candidate" "$front_domain" "入口域名"; then
+        rm -f -- "$candidate"
+        return 1
+    fi
+    if ! ensure_domain_available_in_file "$candidate" "$route_domain" "线路域名"; then
+        rm -f -- "$candidate"
+        return 1
+    fi
+
+    config_block="$(build_stream_config_block \
+        "$front_domain" "$route_domain" "$api_upstream" "$stream_upstream" \
+        "$stream_prefix" "$site_id")"
+    if ! append_block_to_file "$candidate" "$config_block"; then
+        error "写入候选推流配置失败，正式配置未修改"
+        rm -f -- "$candidate"
+        return 1
+    fi
+
     apply_candidate "$candidate"
 }
 
 
 configure_stream_proxy() {
     local front_domain route_domain api_upstream stream_upstream
-    local stream_prefix default_prefix site_id stream_host api_host config_block
-    local candidate confirm
+    local stream_prefix default_prefix site_id stream_host api_host
+    local confirm apply_status
 
     echo -e "------------------------------------------------"
     echo -e "${SKYBLUE}添加/覆盖 前后端反代推流配置（支持多站）${PLAIN}"
@@ -666,12 +1269,14 @@ configure_stream_proxy() {
         error "客户端入口域名格式无效"
         return 1
     fi
+    front_domain="${front_domain,,}"
 
     read -r -p "2. 线路域名 / Hills 路径（例如 db.example.com）: " route_domain < /dev/tty
     if ! validate_domain "$route_domain"; then
         error "线路域名格式无效"
         return 1
     fi
+    route_domain="${route_domain,,}"
 
     if [[ "$front_domain" == "$route_domain" ]]; then
         error "客户端入口域名和线路域名不能相同"
@@ -704,6 +1309,8 @@ configure_stream_proxy() {
 
     stream_host="$(extract_url_host "$stream_upstream")"
     api_host="$(extract_url_host "$api_upstream")"
+    stream_host="${stream_host,,}"
+    api_host="${api_host,,}"
     if [[ "$api_host" == "$front_domain" || "$api_host" == "$route_domain" \
         || "$stream_host" == "$front_domain" || "$stream_host" == "$route_domain" ]]; then
         error "上游地址不能指向本配置的公网入口域名，否则会形成反代循环"
@@ -727,43 +1334,17 @@ configure_stream_proxy() {
     read -r -p "6. 确认写入？[y/N]: " confirm < /dev/tty
     [[ "$confirm" =~ ^[Yy]$ ]] || { warn "已取消"; return 0; }
 
-    candidate="$(new_candidate_file)"
-    if [[ -f "$CADDYFILE" ]]; then
-        if stream_group_exists "$front_domain"; then
-            remove_stream_group_file "$CADDYFILE" "$candidate" "$front_domain" || {
-                error "现有推流组标记不完整，已停止操作"
-                rm -f "$candidate"
-                return 1
-            }
-        else
-            cp "$CADDYFILE" "$candidate"
-        fi
-    else
-        : > "$candidate"
-    fi
-
-    if domain_block_exists_in_file "$candidate" "$front_domain"; then
-        error "入口域名 $front_domain 已被其他配置使用，未做任何修改"
-        rm -f "$candidate"
-        return 1
-    fi
-    if domain_block_exists_in_file "$candidate" "$route_domain"; then
-        error "线路域名 $route_domain 已被其他配置使用，未做任何修改"
-        rm -f "$candidate"
-        return 1
-    fi
-
-    config_block="$(build_stream_config_block \
+    if commit_stream_proxy_config \
         "$front_domain" "$route_domain" "$api_upstream" "$stream_upstream" \
-        "$stream_prefix" "$site_id")"
-    append_block_to_file "$candidate" "$config_block"
-
-    if apply_candidate "$candidate"; then
+        "$stream_prefix" "$site_id"; then
         echo -e "\n${GREEN}Hills 填写：${PLAIN}"
         echo -e "地址：https://$front_domain"
         echo -e "端口：443"
         echo -e "路径：/$route_domain"
         echo -e "请确认两个公网域名均已解析到本 VPS。"
+    else
+        apply_status=$?
+        return "$apply_status"
     fi
 }
 
@@ -886,26 +1467,28 @@ delete_config() {
     read -r -p "确定删除？[y/N]: " confirm < /dev/tty
     [[ "$confirm" =~ ^[Yy]$ ]] || { warn "已取消"; return 0; }
 
-    candidate="$(new_candidate_file)"
+    if ! candidate="$(new_candidate_file)"; then
+        return 1
+    fi
     case "$selected_type" in
         stream)
             remove_stream_group_file "$CADDYFILE" "$candidate" "$selected_key" || {
                 error "推流组标记不完整，未删除任何配置"
-                rm -f "$candidate"
+                rm -f -- "$candidate"
                 return 1
             }
             ;;
         managed)
             remove_managed_site_file "$CADDYFILE" "$candidate" "$selected_key" || {
                 error "普通站点标记不完整，未删除任何配置"
-                rm -f "$candidate"
+                rm -f -- "$candidate"
                 return 1
             }
             ;;
         legacy)
             remove_site_block_file "$CADDYFILE" "$candidate" "$selected_key" || {
                 error "旧版站点块结构异常，未删除任何配置"
-                rm -f "$candidate"
+                rm -f -- "$candidate"
                 return 1
             }
             ;;
@@ -916,6 +1499,9 @@ delete_config() {
 
 
 restart_caddy() {
+    local was_active=false
+    local old_pid="" new_pid service_state
+
     if [[ ! -s "$CADDYFILE" ]]; then
         error "Caddyfile 不存在或为空，请先添加配置"
         return 1
@@ -926,15 +1512,42 @@ restart_caddy() {
         return 1
     fi
 
+    service_state="$(caddy_active_state)" || {
+        error "无法读取 Caddy 服务状态，未执行重启"
+        return 1
+    }
+    case "$service_state" in
+        active)
+            was_active=true
+            old_pid="$(caddy_main_pid)" || old_pid=""
+            if [[ ! "$old_pid" =~ ^[1-9][0-9]*$ ]]; then
+                error "无法确认当前 Caddy 主进程，未执行重启"
+                return 1
+            fi
+            ;;
+        inactive|failed)
+            ;;
+        *)
+            error "Caddy 服务处于无法安全重启的状态：${service_state:-未知}"
+            return 1
+            ;;
+    esac
+
     log "正在重启 Caddy..."
-    systemctl restart caddy
-    sleep 2
-    if systemctl is-active --quiet caddy; then
-        log "Caddy 已正常运行"
-    else
+    if ! systemctl restart caddy; then
+        error "Caddy 重启命令失败，请查看：systemctl status caddy -l"
+        return 1
+    fi
+    if ! caddy_service_is_healthy; then
         error "Caddy 启动失败，请查看：systemctl status caddy -l"
         return 1
     fi
+    new_pid="$(caddy_main_pid)" || new_pid=""
+    if [[ "$was_active" == "true" && "$new_pid" == "$old_pid" ]]; then
+        error "Caddy 主进程未发生变化，不能确认重启成功"
+        return 1
+    fi
+    log "Caddy 已正常运行"
 }
 
 

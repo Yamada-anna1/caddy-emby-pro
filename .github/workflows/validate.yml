@@ -12,13 +12,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install ShellCheck
+      - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck
+          sudo apt-get install -y shellcheck jq
+          curl -fsSL --retry 3 \
+            'https://caddyserver.com/api/download?os=linux&arch=amd64' \
+            -o /tmp/caddy
+          sudo install -m 0755 /tmp/caddy /usr/local/bin/caddy
       - name: Bash syntax
-        run: bash -n install_caddy_emby.sh tests/test.sh
+        run: bash -n install_caddy_emby.sh tests/test.sh tests/caddy_integration.sh
       - name: ShellCheck
-        run: shellcheck install_caddy_emby.sh tests/test.sh
+        run: shellcheck install_caddy_emby.sh tests/test.sh tests/caddy_integration.sh
       - name: Unit tests
         run: bash tests/test.sh
+      - name: Caddy integration tests
+        run: bash tests/caddy_integration.sh
