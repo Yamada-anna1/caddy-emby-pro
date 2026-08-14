@@ -1,0 +1,24 @@
+name: Validate Bash
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+      - name: Bash syntax
+        run: bash -n install_caddy_emby.sh tests/test.sh
+      - name: ShellCheck
+        run: shellcheck install_caddy_emby.sh tests/test.sh
+      - name: Unit tests
+        run: bash tests/test.sh
