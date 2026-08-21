@@ -13,6 +13,7 @@
 - 自动安装并管理 Caddy
 - 普通反代，多站点追加或同域名覆盖
 - 前后端反代推流，多站点独立 snippet
+- Hills 默认只填写入口域名和 443，路径留空；旧路径与第二域名继续兼容
 - 自动解析实际流节点并生成 `Location` 正则
 - 内部推流前缀，不依赖上游路径必须是 `/stream/*`
 - 流节点再次返回 302 时继续改写，防止客户端绕过 VPS
@@ -65,7 +66,7 @@ sudo bash ./install_caddy_emby.sh
 | 顺序 | 参数 | 示例 | 说明 |
 |---|---|---|---|
 | 1 | 客户端入口域名 | `dao.example.com` | Hills 实际连接的域名，不带协议和路径 |
-| 2 | 线路域名 / Hills 路径 | `db.example.com` | Hills 路径为 `/db.example.com` |
+| 2 | 兼容线路域名（必填） | `db.example.com` | 保留旧路径 `/db.example.com` 和备用直连，不是默认 Hills 路径 |
 | 3 | 登录/API 上游 URL | `https://api.example.com:443` | 登录、媒体库、图片和播放接口入口 |
 | 4 | 实际 302 推流上游 URL | `https://stream.example.com:443` | 必须以真实播放请求的 `Location` 为准 |
 | 5 | 内部推流前缀 | `__dao_stream` | 自动生成，可修改；不是 Hills 路径 |
@@ -76,7 +77,14 @@ sudo bash ./install_caddy_emby.sh
 ```text
 地址：https://dao.example.com
 端口：443
-路径：/db.example.com
+路径：留空（不要填写 `/`）
+```
+
+已有客户端无需迁移，仍可继续使用：
+
+```text
+兼容旧路径：/db.example.com
+备用直连：https://db.example.com
 ```
 
 ### 工作流程
@@ -84,9 +92,15 @@ sudo bash ./install_caddy_emby.sh
 ```text
 Hills
   │
-  ├─ https://dao.example.com/db.example.com/...
+  ├─ https://dao.example.com/emby/...
   │          ↓
   │       Caddy → 登录/API 上游
+  │
+  ├─ 旧客户端仍可使用：
+  │    https://dao.example.com/db.example.com/emby/...
+  │    https://db.example.com/emby/...
+  │          ↓
+  │       Caddy → 同一个登录/API 上游
   │
   └─ API 返回 302：
        https://真实流节点/任意路径?签名
@@ -96,11 +110,11 @@ Hills
        Caddy → 真实流节点
 ```
 
-`handle_path` 只删除脚本添加的内部前缀，原始路径、Range 请求、查询参数和签名会原样发送到实际流节点。
+入口域名的根路径会直接进入 API 上游。兼容旧路径的 `handle_path` 只删除旧线路前缀，内部推流的 `handle_path` 只删除内部前缀；剩余原始路径、Range 请求、查询参数和签名都会继续转发。
 
 ## DNS 要求
 
-菜单 3 至少需要两条 DNS 记录都指向 VPS：
+菜单 3 继续保留兼容线路域名。为保证默认入口、兼容线路域名的备用直连及其证书均可用，两条 DNS 记录都必须指向 VPS：
 
 ```text
 dao.example.com  A/AAAA  → VPS
@@ -138,10 +152,11 @@ unset U
 ## 多站点、覆盖和删除
 
 - 每个推流站点都有稳定的唯一 snippet 名称和独立内部前缀。
+- 新增 Hills 线路时默认将路径留空；现有 `/兼容线路域名` 路径无需修改，仍然有效。
 - 相同客户端入口域名再次添加时，只替换该站点整组配置。
 - 其他普通站点和推流站点会保留。
 - 如果新域名已经被未托管配置占用，脚本会拒绝修改，避免误删手写配置。检测范围包括多域名站点、带协议或端口的站点地址、大小写差异、通配符以及 `import` 引入的配置。
-- 菜单 4 删除推流站点时，会同时删除 API snippet、流 snippet、线路域名块和客户端入口域名块。
+- 菜单 4 删除推流站点时，会同时删除 API snippet、流 snippet、兼容线路域名块和客户端入口域名块。
 - Caddyfile 修改前最多保留 5 份经过内容校验的唯一备份，位置为 `/var/backups/caddy-emby-pro/`。
 
 写入时先生成与 Caddyfile 位于同一目录的候选文件。候选配置通过 `caddy fmt`、`caddy validate` 和 adapter 解析后才会备份并原子替换正式文件；备份失败、并发修改、权限复制失败、写入校验失败、服务处于过渡/未知状态或 Caddy 重启失败都会停止操作。重启失败时，脚本会先确认磁盘上的文件仍是本次候选版本，再分别验证磁盘配置和服务状态是否恢复成功；若发现其他进程已写入新内容，会保留该内容和旧备份，拒绝用旧配置覆盖。

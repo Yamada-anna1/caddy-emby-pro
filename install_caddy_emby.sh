@@ -1232,7 +1232,7 @@ commit_stream_proxy_config() {
         rm -f -- "$candidate"
         return 1
     fi
-    if ! ensure_domain_available_in_file "$candidate" "$route_domain" "线路域名"; then
+    if ! ensure_domain_available_in_file "$candidate" "$route_domain" "兼容线路域名"; then
         rm -f -- "$candidate"
         return 1
     fi
@@ -1271,15 +1271,19 @@ configure_stream_proxy() {
     fi
     front_domain="${front_domain,,}"
 
-    read -r -p "2. 线路域名 / Hills 路径（例如 db.example.com）: " route_domain < /dev/tty
+    read -r -p "2. 兼容线路域名（必填，用于旧路径/备用直连，例如 db.example.com）: " route_domain < /dev/tty
+    if [[ -z "$route_domain" ]]; then
+        error "兼容线路域名为必填项"
+        return 1
+    fi
     if ! validate_domain "$route_domain"; then
-        error "线路域名格式无效"
+        error "兼容线路域名格式无效"
         return 1
     fi
     route_domain="${route_domain,,}"
 
     if [[ "$front_domain" == "$route_domain" ]]; then
-        error "客户端入口域名和线路域名不能相同"
+        error "客户端入口域名和兼容线路域名不能相同"
         return 1
     fi
 
@@ -1313,7 +1317,7 @@ configure_stream_proxy() {
     api_host="${api_host,,}"
     if [[ "$api_host" == "$front_domain" || "$api_host" == "$route_domain" \
         || "$stream_host" == "$front_domain" || "$stream_host" == "$route_domain" ]]; then
-        error "上游地址不能指向本配置的公网入口域名，否则会形成反代循环"
+        error "上游地址不能指向本配置的入口域名或兼容线路域名，否则会形成反代循环"
         return 1
     fi
     site_id="$(make_site_id "$front_domain")"
@@ -1321,7 +1325,9 @@ configure_stream_proxy() {
     echo -e "\n${SKYBLUE}配置摘要${PLAIN}"
     echo -e "客户端入口 : https://$front_domain"
     echo -e "Hills 端口 : 443"
-    echo -e "Hills 路径 : /$route_domain"
+    echo -e "Hills 路径 : 留空（不要填写 /）"
+    echo -e "兼容旧路径 : /$route_domain"
+    echo -e "备用直连   : https://$route_domain"
     echo -e "API 上游   : $api_upstream"
     echo -e "实际流节点 : $stream_host"
     echo -e "推流上游   : $stream_upstream"
@@ -1340,8 +1346,10 @@ configure_stream_proxy() {
         echo -e "\n${GREEN}Hills 填写：${PLAIN}"
         echo -e "地址：https://$front_domain"
         echo -e "端口：443"
-        echo -e "路径：/$route_domain"
-        echo -e "请确认两个公网域名均已解析到本 VPS。"
+        echo -e "路径：留空（不要填写 /）"
+        echo -e "兼容旧路径：/$route_domain"
+        echo -e "备用直连：https://$route_domain"
+        echo -e "请确认入口域名和兼容线路域名均已解析到本 VPS。"
     else
         apply_status=$?
         return "$apply_status"
@@ -1374,7 +1382,7 @@ collect_delete_entries() {
 
     while IFS=$'\t' read -r front route; do
         [[ -n "$front" ]] || continue
-        add_delete_entry "stream" "$front" "[推流] $front（线路：$route）" "$route"
+        add_delete_entry "stream" "$front" "[推流] $front（路径留空；兼容线路：$route）" "$route"
     done < <(awk '
         $1 == "#" && $2 == "BEGIN" && $3 == "CADDY_EMBY_STREAM" {
             print $4 "\t" $5

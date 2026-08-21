@@ -23,7 +23,7 @@ fail() {
 assert_contains() {
     local haystack="$1"
     local needle="$2"
-    grep -Fq "$needle" <<< "$haystack" || fail "missing: $needle"
+    [[ "$haystack" == *"$needle"* ]] || fail "missing: $needle"
 }
 
 validate_domain "dao.example.com" || fail "valid domain rejected"
@@ -50,8 +50,15 @@ assert_contains "$block" "(${site_id}_stream)"
 assert_contains "$block" 'header_down Location "(?i)^https?://stream[.]example[.]com(:[0-9]+)?/" "https://dao.example.com/__dao_stream/"'
 ! grep -Fq '(?:' <<< "$block" \
     || fail "stream Location regex contains a Go-incompatible non-capturing group"
-assert_contains "$block" "handle_path /db.example.com/*"
-assert_contains "$block" "handle_path /__dao_stream/*"
+assert_contains "$block" "    handle_path /db.example.com/* {
+        import ${site_id}_api
+    }"
+assert_contains "$block" "    handle_path /__dao_stream/* {
+        import ${site_id}_stream
+    }"
+assert_contains "$block" "    handle {
+        import ${site_id}_api
+    }"
 assert_contains "$block" "$STREAM_END dao.example.com"
 
 printf '%s\n\n%s\n' "$block" 'keep.example.com {' > "$CADDYFILE"
