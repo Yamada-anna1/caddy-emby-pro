@@ -129,21 +129,21 @@ stream_b_response="$(curl -fsS --noproxy '*' --resolve "$route_resolve" \
 redirect_a_headers="$(curl -sS --noproxy '*' --resolve "$front_resolve" \
     --max-redirs 0 -D - -o /dev/null \
     "http://dao.example.com:$proxy_port/redirect/a" | tr -d '\r')"
-grep -Fqi "location: http://dao.example.com:$proxy_port/__dao_stream/stream/a.mkv?sig=a" \
+grep -Fqi "location: http://dao.example.com/__dao_stream/stream/a.mkv?sig=a" \
     <<< "$redirect_a_headers" \
     || fail "first stream Location was not rewritten to the requesting front domain"
 
 redirect_b_headers="$(curl -sS --noproxy '*' --resolve "$route_resolve" \
     --max-redirs 0 -D - -o /dev/null \
     "http://db.example.com:$proxy_port/redirect/b" | tr -d '\r')"
-grep -Fqi "location: http://db.example.com:$proxy_port/$second_prefix/stream/b.mkv?sig=b" \
+grep -Fqi "location: http://db.example.com/$second_prefix/stream/b.mkv?sig=b" \
     <<< "$redirect_b_headers" \
     || fail "second stream Location was not rewritten to the requesting compatibility domain"
 
 chain_headers="$(curl -sS --noproxy '*' --resolve "$front_resolve" \
     --max-redirs 0 -D - -o /dev/null \
     "http://dao.example.com:$proxy_port/$second_prefix/hop-to-a" | tr -d '\r')"
-grep -Fqi "location: http://dao.example.com:$proxy_port/__dao_stream/stream/final.mkv?sig=chain" \
+grep -Fqi "location: http://dao.example.com/__dao_stream/stream/final.mkv?sig=chain" \
     <<< "$chain_headers" \
     || fail "secondary stream redirect escaped the VPS"
 
