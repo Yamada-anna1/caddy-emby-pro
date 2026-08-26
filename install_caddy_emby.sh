@@ -1340,7 +1340,7 @@ configure_stream_proxy() {
     fi
     front_domain="${front_domain,,}"
 
-    read -r -p "2. 兼容线路域名（必填，用于旧路径/备用直连，例如 db.example.com）: " route_domain < /dev/tty
+    read -r -p "2. 兼容线路域名（必填，用于兼容路径/备用直连，例如 db.example.com）: " route_domain < /dev/tty
     if [[ -z "$route_domain" ]]; then
         error "兼容线路域名为必填项"
         return 1
@@ -1399,9 +1399,9 @@ configure_stream_proxy() {
 
     echo -e "\n${SKYBLUE}配置摘要${PLAIN}"
     echo -e "客户端入口 : https://$front_domain"
-    echo -e "Hills 端口 : 443"
-    echo -e "Hills 路径 : 留空（不要填写 /）"
-    echo -e "兼容旧路径 : /$route_domain"
+    echo -e "客户端端口 : 443"
+    echo -e "客户端路径 : 留空（不要填写 /）"
+    echo -e "兼容路径   : /$route_domain"
     echo -e "备用直连   : https://$route_domain"
     echo -e "API 上游   : $api_upstream"
     echo -e "推流节点数 : ${#stream_upstreams[@]}"
@@ -1420,11 +1420,11 @@ configure_stream_proxy() {
     if commit_stream_proxy_config \
         "$front_domain" "$route_domain" "$api_upstream" "$stream_upstream_list" \
         "$stream_prefix" "$site_id"; then
-        echo -e "\n${GREEN}Hills 填写：${PLAIN}"
+        echo -e "\n${GREEN}客户端/播放器填写：${PLAIN}"
         echo -e "地址：https://$front_domain"
         echo -e "端口：443"
         echo -e "路径：留空（不要填写 /）"
-        echo -e "兼容旧路径：/$route_domain"
+        echo -e "兼容路径：/$route_domain"
         echo -e "备用直连：https://$route_domain"
         echo -e "请确认入口域名和兼容线路域名均已解析到本 VPS。"
     else

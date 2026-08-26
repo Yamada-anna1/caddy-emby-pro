@@ -102,12 +102,12 @@ done
 root_response="$(curl -fsS --noproxy '*' --resolve "$front_resolve" \
     "http://dao.example.com:$proxy_port/emby/System/Info/Public?token=a")"
 [[ "$root_response" == 'api /emby/System/Info/Public?token=a' ]] \
-    || fail "pathless Hills request did not reach the API upstream unchanged"
+    || fail "pathless client request did not reach the API upstream unchanged"
 
 legacy_response="$(curl -fsS --noproxy '*' --resolve "$front_resolve" \
     "http://dao.example.com:$proxy_port/db.example.com/emby/Items/1?x=2")"
 [[ "$legacy_response" == 'api /emby/Items/1?x=2' ]] \
-    || fail "legacy Hills path was not stripped before reaching the API upstream"
+    || fail "compatibility path was not stripped before reaching the API upstream"
 
 route_response="$(curl -fsS --noproxy '*' --resolve "$route_resolve" \
     "http://db.example.com:$proxy_port/emby/Items/2?x=3")"
@@ -151,9 +151,9 @@ redirect_headers="$(curl -sS --noproxy '*' --resolve "$front_resolve" \
     --max-redirs 0 -D - -o /dev/null \
     "http://dao.example.com:$proxy_port/db.example.com" | tr -d '\r')"
 grep -Eq '^HTTP/[0-9.]+ 308' <<< "$redirect_headers" \
-    || fail "legacy path root did not return HTTP 308"
+    || fail "compatibility path root did not return HTTP 308"
 grep -Fqi 'location: /db.example.com/' <<< "$redirect_headers" \
-    || fail "legacy path root redirect target is incorrect"
+    || fail "compatibility path root redirect target is incorrect"
 
 kill "$CADDY_TEST_PID" 2>/dev/null || true
 wait "$CADDY_TEST_PID" 2>/dev/null || true

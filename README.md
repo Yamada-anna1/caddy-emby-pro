@@ -4,7 +4,7 @@
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Version](https://img.shields.io/badge/Version-V6%20Pro-orange.svg)
 
-交互式 Caddy 管理脚本，支持普通 Emby 反向代理，以及“登录/API 上游 + 实际视频流上游”的前后端分流。脚本会接管上游返回的 `302 Location`，将最终视频请求重新导向 VPS 上的 Caddy。
+交互式 Caddy 管理脚本，支持普通 Emby 反向代理，以及“登录/API 上游 + 实际视频流上游”的前后端分流。脚本会接管上游返回的 `302 Location`，将最终视频请求重新导向 VPS 上的 Caddy。配置不依赖特定客户端的专有能力，适用于支持自定义 Emby 服务器地址的客户端和播放器。
 
 > 本项目不提供 Emby 账号、节点或绕过授权功能。请仅代理你有权访问的服务，并遵守上游服务、Cloudflare 和 VPS 服务商的使用条款。
 
@@ -13,7 +13,7 @@
 - 自动安装并管理 Caddy
 - 普通反代，多站点追加或同域名覆盖
 - 前后端反代推流，多站点独立 snippet
-- Hills 默认只填写入口域名和 443，路径留空；旧路径与第二域名继续兼容
+- 默认接入仅需填写入口域名和 443，客户端/播放器路径留空；兼容路径与兼容线路域名仍可继续使用
 - 支持 1–8 个固定流节点，每个节点生成独立内部路径和 `Location` 正则
 - 入口域名与兼容线路域名都会在本域内接管视频流，避免跨域丢失鉴权信息
 - 内部推流前缀，不依赖上游路径必须是 `/stream/*`
@@ -66,14 +66,14 @@ sudo bash ./install_caddy_emby.sh
 
 | 顺序 | 参数 | 示例 | 说明 |
 |---|---|---|---|
-| 1 | 客户端入口域名 | `dao.example.com` | Hills 实际连接的域名，不带协议和路径 |
-| 2 | 兼容线路域名（必填） | `db.example.com` | 保留旧路径 `/db.example.com` 和备用直连，不是默认 Hills 路径 |
+| 1 | 客户端入口域名 | `dao.example.com` | 客户端或播放器实际连接的域名，不带协议和路径 |
+| 2 | 兼容线路域名（必填） | `db.example.com` | 提供兼容路径 `/db.example.com` 和备用直连；客户端/播放器默认将路径留空 |
 | 3 | 登录/API 上游 URL | `https://api.example.com:443` | 登录、媒体库、图片和播放接口入口 |
 | 4 | 实际 302 推流上游 URL | `https://stream-a.example.com:443,https://stream-b.example.com:443` | 支持 1–8 个节点，以逗号分隔；顺序填写所有实际 `Location` 主机 |
-| 5 | 内部推流前缀 | `__dao_stream` | 自动生成，可修改；不是 Hills 路径 |
+| 5 | 内部推流前缀 | `__dao_stream` | 自动生成，可修改；不是客户端需要填写的路径 |
 | 6 | 摘要确认 | `y/N` | 确认前不会修改 Caddyfile |
 
-对应的 Hills 配置：
+客户端/播放器填写示例：
 
 ```text
 地址：https://dao.example.com
@@ -84,14 +84,14 @@ sudo bash ./install_caddy_emby.sh
 已有客户端无需迁移，仍可继续使用：
 
 ```text
-兼容旧路径：/db.example.com
+兼容路径：/db.example.com
 备用直连：https://db.example.com
 ```
 
 ### 工作流程
 
 ```text
-Hills
+Emby 客户端/播放器
   │
   ├─ https://dao.example.com/emby/...
   │          ↓
@@ -111,7 +111,7 @@ Hills
        https://当前请求域名/__dao_stream_节点B_.../ → 流节点B
 ```
 
-入口域名的根路径会直接进入 API 上游。兼容旧路径的 `handle_path` 只删除旧线路前缀，各流节点的 `handle_path` 只删除自己的内部前缀；剩余原始路径、Range 请求、查询参数和签名都会继续转发。第一个流节点继续使用基础内部前缀，便于兼容短期缓存的旧播放地址。
+入口域名的根路径会直接进入 API 上游。兼容路径的 `handle_path` 只删除线路前缀，各流节点的 `handle_path` 只删除自己的内部前缀；剩余原始路径、Range 请求、查询参数和签名都会继续转发。第一个流节点继续使用基础内部前缀，便于兼容短期缓存的旧播放地址。
 
 ## DNS 要求
 
@@ -159,7 +159,7 @@ unset U
 ## 多站点、覆盖和删除
 
 - 每个推流站点都有稳定的唯一 snippet 名称和独立内部前缀。
-- 新增 Hills 线路时默认将路径留空；现有 `/兼容线路域名` 路径无需修改，仍然有效。
+- 新增推流线路时，客户端/播放器路径默认留空；现有以 `/兼容线路域名` 形式配置的兼容路径无需修改，仍然有效。
 - 相同客户端入口域名再次添加时，只替换该站点整组配置。
 - 其他普通站点和推流站点会保留。
 - 如果新域名已经被未托管配置占用，脚本会拒绝修改，避免误删手写配置。检测范围包括多域名站点、带协议或端口的站点地址、大小写差异、通配符以及 `import` 引入的配置。
@@ -194,7 +194,7 @@ unset U
 
 - 本项目基于 [AiLi1337/caddy_emby](https://github.com/AiLi1337/caddy_emby) 扩展，保留原作者署名。
 - Caddy 配置行为参考 [Caddy 官方文档](https://caddyserver.com/docs/)。
-- 本项目与 Caddy、Emby、Hills 官方无隶属或授权关系。
+- 本项目与 Caddy、Emby 及任何第三方客户端/播放器的官方项目均无隶属或授权关系。
 
 ## License
 
