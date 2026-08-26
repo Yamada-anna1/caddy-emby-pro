@@ -44,8 +44,10 @@ caddy validate --config "$CADDYFILE" --adapter caddyfile
 proxy_port="${CADDY_TEST_PROXY_PORT:-28080}"
 api_port="${CADDY_TEST_API_PORT:-28081}"
 stream_port="${CADDY_TEST_STREAM_PORT:-28082}"
+stream_b_port="${CADDY_TEST_STREAM_B_PORT:-28083}"
 runtime_caddyfile="$TEST_TMP/Caddyfile.runtime"
 runtime_log="$TEST_TMP/caddy-runtime.log"
+second_prefix="$(stream_route_prefix '__dao_stream' 1 'localhost')"
 
 {
     printf '%s\n' '{' '    admin off' '}' ''
@@ -53,14 +55,24 @@ runtime_log="$TEST_TMP/caddy-runtime.log"
         "dao.example.com" \
         "db.example.com" \
         "http://127.0.0.1:$api_port" \
-        "http://127.0.0.1:$stream_port" \
+        "http://127.0.0.1:$stream_port,http://localhost:$stream_b_port" \
         "__dao_stream" \
         "$site_id" \
         | sed \
             -e "s/^db[.]example[.]com {/http:\/\/db.example.com:$proxy_port {/" \
-            -e "s/^dao[.]example[.]com {/http:\/\/dao.example.com:$proxy_port {/"
-    printf '\nhttp://127.0.0.1:%s {\n    respond "api {http.request.uri}"\n}\n' "$api_port"
-    printf '\nhttp://127.0.0.1:%s {\n    respond "stream {http.request.uri}"\n}\n' "$stream_port"
+            -e "s/^dao[.]example[.]com {/http:\/\/dao.example.com:$proxy_port {/" \
+            -e 's#https://{http.request.host}/#http://{http.request.host}/#g'
+    printf '\nhttp://127.0.0.1:%s {\n' "$api_port"
+    printf '    @stream_a path /redirect/a\n'
+    printf '    redir @stream_a "http://127.0.0.1:%s/stream/a.mkv?sig=a" 302\n' "$stream_port"
+    printf '    @stream_b path /redirect/b\n'
+    printf '    redir @stream_b "http://localhost:%s/stream/b.mkv?sig=b" 302\n' "$stream_b_port"
+    printf '    respond "api {http.request.uri}"\n}\n'
+    printf '\nhttp://127.0.0.1:%s {\n    respond "stream-a {http.request.uri} range={http.request.header.Range}"\n}\n' "$stream_port"
+    printf '\nhttp://localhost:%s {\n' "$stream_b_port"
+    printf '    @hop path /hop-to-a\n'
+    printf '    redir @hop "http://127.0.0.1:%s/stream/final.mkv?sig=chain" 302\n' "$stream_port"
+    printf '    respond "stream-b {http.request.uri} range={http.request.header.Range}"\n}\n'
 } > "$runtime_caddyfile"
 
 caddy validate --config "$runtime_caddyfile" --adapter caddyfile
@@ -103,9 +115,37 @@ route_response="$(curl -fsS --noproxy '*' --resolve "$route_resolve" \
     || fail "compatibility domain did not reach the API upstream unchanged"
 
 stream_response="$(curl -fsS --noproxy '*' --resolve "$front_resolve" \
+    -H 'Range: bytes=0-0' \
     "http://dao.example.com:$proxy_port/__dao_stream/stream/file.mkv?sig=abc")"
-[[ "$stream_response" == 'stream /stream/file.mkv?sig=abc' ]] \
+[[ "$stream_response" == 'stream-a /stream/file.mkv?sig=abc range=bytes=0-0' ]] \
     || fail "internal stream path did not take priority over the API fallback"
+
+stream_b_response="$(curl -fsS --noproxy '*' --resolve "$route_resolve" \
+    -H 'Range: bytes=10-20' \
+    "http://db.example.com:$proxy_port/$second_prefix/stream/file.mkv?sig=def")"
+[[ "$stream_b_response" == 'stream-b /stream/file.mkv?sig=def range=bytes=10-20' ]] \
+    || fail "second stream node did not preserve route-domain Range or signature"
+
+redirect_a_headers="$(curl -sS --noproxy '*' --resolve "$front_resolve" \
+    --max-redirs 0 -D - -o /dev/null \
+    "http://dao.example.com:$proxy_port/redirect/a" | tr -d '\r')"
+grep -Fqi "location: http://dao.example.com:$proxy_port/__dao_stream/stream/a.mkv?sig=a" \
+    <<< "$redirect_a_headers" \
+    || fail "first stream Location was not rewritten to the requesting front domain"
+
+redirect_b_headers="$(curl -sS --noproxy '*' --resolve "$route_resolve" \
+    --max-redirs 0 -D - -o /dev/null \
+    "http://db.example.com:$proxy_port/redirect/b" | tr -d '\r')"
+grep -Fqi "location: http://db.example.com:$proxy_port/$second_prefix/stream/b.mkv?sig=b" \
+    <<< "$redirect_b_headers" \
+    || fail "second stream Location was not rewritten to the requesting compatibility domain"
+
+chain_headers="$(curl -sS --noproxy '*' --resolve "$front_resolve" \
+    --max-redirs 0 -D - -o /dev/null \
+    "http://dao.example.com:$proxy_port/$second_prefix/hop-to-a" | tr -d '\r')"
+grep -Fqi "location: http://dao.example.com:$proxy_port/__dao_stream/stream/final.mkv?sig=chain" \
+    <<< "$chain_headers" \
+    || fail "secondary stream redirect escaped the VPS"
 
 redirect_headers="$(curl -sS --noproxy '*' --resolve "$front_resolve" \
     --max-redirs 0 -D - -o /dev/null \

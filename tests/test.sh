@@ -30,6 +30,13 @@ validate_domain "dao.example.com" || fail "valid domain rejected"
 ! validate_domain "https://dao.example.com" || fail "invalid domain accepted"
 validate_upstream_url "https://stream.example.com:443" || fail "valid upstream rejected"
 ! validate_upstream_url "stream.example.com:443/path" || fail "invalid upstream accepted"
+[[ "$(normalize_stream_upstream_list ' https://stream-a.example.com:443,https://stream-b.example.com:443/ ')" \
+    == 'https://stream-a.example.com:443,https://stream-b.example.com:443' ]] \
+    || fail "stream upstream list was not normalized"
+! normalize_stream_upstream_list 'https://stream.example.com,https://stream.example.com:443' >/dev/null \
+    || fail "duplicate stream host was accepted"
+! normalize_stream_upstream_list 'https://stream.example.com/path' >/dev/null \
+    || fail "stream upstream path was accepted"
 valid_menu_choice 10 || fail "menu choice 10 rejected"
 ! valid_menu_choice 11 || fail "menu choice 11 accepted"
 
@@ -47,7 +54,9 @@ block="$(build_stream_config_block \
 assert_contains "$block" "$STREAM_BEGIN dao.example.com db.example.com"
 assert_contains "$block" "(${site_id}_api)"
 assert_contains "$block" "(${site_id}_stream)"
-assert_contains "$block" 'header_down Location "(?i)^https?://stream[.]example[.]com(:[0-9]+)?/" "https://dao.example.com/__dao_stream/"'
+assert_contains "$block" 'header_up Host api.example.com'
+assert_contains "$block" 'header_up Host stream.example.com'
+assert_contains "$block" 'header_down Location "(?i)^https?://stream[.]example[.]com(:[0-9]+)?/" "https://{http.request.host}/__dao_stream/"'
 ! grep -Fq '(?:' <<< "$block" \
     || fail "stream Location regex contains a Go-incompatible non-capturing group"
 assert_contains "$block" "    handle_path /db.example.com/* {
@@ -60,6 +69,27 @@ assert_contains "$block" "    handle {
         import ${site_id}_api
     }"
 assert_contains "$block" "$STREAM_END dao.example.com"
+
+second_prefix="$(stream_route_prefix '__dao_stream' 1 'stream-b.example.com')"
+multi_block="$(build_stream_config_block \
+    "dao.example.com" \
+    "db.example.com" \
+    "https://api.example.com:443" \
+    "https://stream-a.example.com:443,https://stream-b.example.com:443" \
+    "__dao_stream" \
+    "$site_id")"
+assert_contains "$multi_block" "(${site_id}_stream_1)"
+assert_contains "$multi_block" "(${site_id}_stream_2)"
+assert_contains "$multi_block" 'header_down Location "(?i)^https?://stream-a[.]example[.]com(:[0-9]+)?/" "https://{http.request.host}/__dao_stream/"'
+assert_contains "$multi_block" "header_down Location \"(?i)^https?://stream-b[.]example[.]com(:[0-9]+)?/\" \"https://{http.request.host}/$second_prefix/\""
+assert_contains "$multi_block" "    handle_path /__dao_stream/* {
+        import ${site_id}_stream_1
+    }"
+assert_contains "$multi_block" "    handle_path /$second_prefix/* {
+        import ${site_id}_stream_2
+    }"
+[[ "$(grep -Fc "handle_path /$second_prefix/*" <<< "$multi_block")" == 2 ]] \
+    || fail "second stream handler was not installed on both public domains"
 
 printf '%s\n\n%s\n' "$block" 'keep.example.com {' > "$CADDYFILE"
 printf '%s\n' '    reverse_proxy 127.0.0.1:8096' '}' >> "$CADDYFILE"

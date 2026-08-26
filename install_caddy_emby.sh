@@ -153,6 +153,55 @@ extract_url_host() {
 }
 
 
+trim_whitespace() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s\n' "$value"
+}
+
+
+normalize_stream_upstream_list() {
+    local input="$1"
+    local item normalized host existing_host
+    local -a raw_items=() normalized_items=() seen_hosts=()
+
+    IFS=',' read -r -a raw_items <<< "$input"
+    (( ${#raw_items[@]} > 0 && ${#raw_items[@]} <= 8 )) || return 1
+
+    for item in "${raw_items[@]}"; do
+        normalized="$(trim_whitespace "$item")"
+        normalized="${normalized%/}"
+        validate_upstream_url "$normalized" || return 1
+        host="$(extract_url_host "$normalized")"
+        host="${host,,}"
+        for existing_host in "${seen_hosts[@]}"; do
+            [[ "$existing_host" != "$host" ]] || return 1
+        done
+        seen_hosts+=("$host")
+        normalized_items+=("$normalized")
+    done
+
+    (IFS=','; printf '%s\n' "${normalized_items[*]}")
+}
+
+
+stream_route_prefix() {
+    local base_prefix="$1"
+    local index="$2"
+    local host="$3"
+    local label checksum
+
+    if (( index == 0 )); then
+        printf '%s\n' "$base_prefix"
+        return 0
+    fi
+    label="$(printf '%s' "${host%%.*}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/_/g')"
+    checksum="$(printf '%s' "$host" | sha256sum | awk '{print substr($1,1,8)}')"
+    printf '%s_%s_%s\n' "$base_prefix" "$label" "$checksum"
+}
+
+
 make_site_id() {
     local front_domain="$1"
     local readable checksum
@@ -960,56 +1009,74 @@ build_stream_config_block() {
     local front_domain="$1"
     local route_domain="$2"
     local api_upstream="$3"
-    local stream_upstream="$4"
+    local stream_upstream_list="$4"
     local stream_prefix="$5"
     local site_id="$6"
-    local stream_host stream_regex
+    local api_host stream_host route_prefix snippet_name
+    local index target_index
+    local -a stream_upstreams=() stream_hosts=() stream_regexes=()
+    local -a route_prefixes=() snippet_names=()
 
-    stream_host="$(extract_url_host "$stream_upstream")"
-    stream_regex="${stream_host//./[.]}"
+    api_host="$(extract_url_host "$api_upstream")"
+    IFS=',' read -r -a stream_upstreams <<< "$stream_upstream_list"
+    for index in "${!stream_upstreams[@]}"; do
+        stream_host="$(extract_url_host "${stream_upstreams[$index]}")"
+        stream_hosts+=("$stream_host")
+        stream_regexes+=("${stream_host//./[.]}")
+        route_prefix="$(stream_route_prefix "$stream_prefix" "$index" "$stream_host")"
+        route_prefixes+=("$route_prefix")
+        if (( ${#stream_upstreams[@]} == 1 )); then
+            snippet_names+=("${site_id}_stream")
+        else
+            snippet_names+=("${site_id}_stream_$((index + 1))")
+        fi
+    done
 
-    cat <<EOF
-$STREAM_BEGIN $front_domain $route_domain
-(${site_id}_api) {
-    reverse_proxy $api_upstream {
-        header_up Host {upstream_hostport}
-        header_up -X-Forwarded-Host
+    printf '%s\n' "$STREAM_BEGIN $front_domain $route_domain"
+    printf '(%s_api) {\n' "$site_id"
+    printf '    reverse_proxy %s {\n' "$api_upstream"
+    printf '        header_up Host %s\n' "$api_host"
+    printf '        header_up -X-Forwarded-Host\n\n'
+    for index in "${!stream_upstreams[@]}"; do
+        printf '        header_down Location "(?i)^https?://%s(:[0-9]+)?/" "https://{http.request.host}/%s/"\n' \
+            "${stream_regexes[$index]}" "${route_prefixes[$index]}"
+    done
+    printf '    }\n}\n'
 
-        header_down Location "(?i)^https?://${stream_regex}(:[0-9]+)?/" "https://${front_domain}/${stream_prefix}/"
-    }
-}
+    for index in "${!stream_upstreams[@]}"; do
+        snippet_name="${snippet_names[$index]}"
+        printf '\n(%s) {\n' "$snippet_name"
+        printf '    reverse_proxy %s {\n' "${stream_upstreams[$index]}"
+        printf '        header_up Host %s\n' "${stream_hosts[$index]}"
+        printf '        header_up -X-Forwarded-Host\n\n'
+        for target_index in "${!stream_upstreams[@]}"; do
+            printf '        header_down Location "(?i)^https?://%s(:[0-9]+)?/" "https://{http.request.host}/%s/"\n' \
+                "${stream_regexes[$target_index]}" "${route_prefixes[$target_index]}"
+        done
+        printf '    }\n}\n'
+    done
 
-(${site_id}_stream) {
-    reverse_proxy $stream_upstream {
-        header_up Host {upstream_hostport}
-        header_up -X-Forwarded-Host
+    printf '\n%s {\n' "$route_domain"
+    for index in "${!stream_upstreams[@]}"; do
+        printf '    handle_path /%s/* {\n' "${route_prefixes[$index]}"
+        printf '        import %s\n' "${snippet_names[$index]}"
+        printf '    }\n\n'
+    done
+    printf '    handle {\n        import %s_api\n    }\n}\n' "$site_id"
 
-        header_down Location "(?i)^https?://${stream_regex}(:[0-9]+)?/" "https://${front_domain}/${stream_prefix}/"
-    }
-}
-
-$route_domain {
-    import ${site_id}_api
-}
-
-$front_domain {
-    @route_root path /${route_domain}
-    redir @route_root /${route_domain}/ 308
-
-    handle_path /${route_domain}/* {
-        import ${site_id}_api
-    }
-
-    handle_path /${stream_prefix}/* {
-        import ${site_id}_stream
-    }
-
-    handle {
-        import ${site_id}_api
-    }
-}
-$STREAM_END $front_domain
-EOF
+    printf '\n%s {\n' "$front_domain"
+    printf '    @route_root path /%s\n' "$route_domain"
+    printf '    redir @route_root /%s/ 308\n\n' "$route_domain"
+    printf '    handle_path /%s/* {\n' "$route_domain"
+    printf '        import %s_api\n' "$site_id"
+    printf '    }\n\n'
+    for index in "${!stream_upstreams[@]}"; do
+        printf '    handle_path /%s/* {\n' "${route_prefixes[$index]}"
+        printf '        import %s\n' "${snippet_names[$index]}"
+        printf '    }\n\n'
+    done
+    printf '    handle {\n        import %s_api\n    }\n}\n' "$site_id"
+    printf '%s\n' "$STREAM_END $front_domain"
 }
 
 
@@ -1203,7 +1270,7 @@ commit_stream_proxy_config() {
     local front_domain="$1"
     local route_domain="$2"
     local api_upstream="$3"
-    local stream_upstream="$4"
+    local stream_upstream_list="$4"
     local stream_prefix="$5"
     local site_id="$6"
     local candidate config_block
@@ -1238,7 +1305,7 @@ commit_stream_proxy_config() {
     fi
 
     config_block="$(build_stream_config_block \
-        "$front_domain" "$route_domain" "$api_upstream" "$stream_upstream" \
+        "$front_domain" "$route_domain" "$api_upstream" "$stream_upstream_list" \
         "$stream_prefix" "$site_id")"
     if ! append_block_to_file "$candidate" "$config_block"; then
         error "写入候选推流配置失败，正式配置未修改"
@@ -1251,9 +1318,11 @@ commit_stream_proxy_config() {
 
 
 configure_stream_proxy() {
-    local front_domain route_domain api_upstream stream_upstream
-    local stream_prefix default_prefix site_id stream_host api_host
+    local front_domain route_domain api_upstream stream_upstream_input stream_upstream_list
+    local stream_prefix default_prefix site_id stream_host api_host upstream
     local confirm apply_status
+    local index
+    local -a stream_upstreams=() stream_hosts=()
 
     echo -e "------------------------------------------------"
     echo -e "${SKYBLUE}添加/覆盖 前后端反代推流配置（支持多站）${PLAIN}"
@@ -1294,12 +1363,12 @@ configure_stream_proxy() {
         return 1
     fi
 
-    read -r -p "4. 实际 302 推流上游 URL（例如 https://stream.example.com:443）: " stream_upstream < /dev/tty
-    stream_upstream="${stream_upstream%/}"
-    if ! validate_upstream_url "$stream_upstream"; then
-        error "推流上游必须是 http:// 或 https:// 开头的域名 URL，且不能包含路径"
+    read -r -p "4. 实际 302 推流上游 URL（多个节点用逗号分隔，最多 8 个）: " stream_upstream_input < /dev/tty
+    if ! stream_upstream_list="$(normalize_stream_upstream_list "$stream_upstream_input")"; then
+        error "推流上游必须是 1-8 个 http:// 或 https:// 域名 URL，不能包含路径或重复主机"
         return 1
     fi
+    IFS=',' read -r -a stream_upstreams <<< "$stream_upstream_list"
 
     default_prefix="$(default_stream_prefix "$front_domain")"
     read -r -p "5. 内部推流前缀（不含 /）[$default_prefix]: " stream_prefix < /dev/tty
@@ -1311,15 +1380,21 @@ configure_stream_proxy() {
         return 1
     fi
 
-    stream_host="$(extract_url_host "$stream_upstream")"
     api_host="$(extract_url_host "$api_upstream")"
-    stream_host="${stream_host,,}"
     api_host="${api_host,,}"
-    if [[ "$api_host" == "$front_domain" || "$api_host" == "$route_domain" \
-        || "$stream_host" == "$front_domain" || "$stream_host" == "$route_domain" ]]; then
+    if [[ "$api_host" == "$front_domain" || "$api_host" == "$route_domain" ]]; then
         error "上游地址不能指向本配置的入口域名或兼容线路域名，否则会形成反代循环"
         return 1
     fi
+    for upstream in "${stream_upstreams[@]}"; do
+        stream_host="$(extract_url_host "$upstream")"
+        stream_host="${stream_host,,}"
+        if [[ "$stream_host" == "$front_domain" || "$stream_host" == "$route_domain" ]]; then
+            error "上游地址不能指向本配置的入口域名或兼容线路域名，否则会形成反代循环"
+            return 1
+        fi
+        stream_hosts+=("$stream_host")
+    done
     site_id="$(make_site_id "$front_domain")"
 
     echo -e "\n${SKYBLUE}配置摘要${PLAIN}"
@@ -1329,9 +1404,11 @@ configure_stream_proxy() {
     echo -e "兼容旧路径 : /$route_domain"
     echo -e "备用直连   : https://$route_domain"
     echo -e "API 上游   : $api_upstream"
-    echo -e "实际流节点 : $stream_host"
-    echo -e "推流上游   : $stream_upstream"
-    echo -e "内部前缀   : /$stream_prefix"
+    echo -e "推流节点数 : ${#stream_upstreams[@]}"
+    for index in "${!stream_upstreams[@]}"; do
+        echo -e "节点 $((index + 1))      : ${stream_upstreams[$index]}"
+        echo -e "内部路径   : /$(stream_route_prefix "$stream_prefix" "$index" "${stream_hosts[$index]}")"
+    done
     if stream_group_exists "$front_domain"; then
         echo -e "写入方式   : 替换相同入口域名的现有推流组"
     else
@@ -1341,7 +1418,7 @@ configure_stream_proxy() {
     [[ "$confirm" =~ ^[Yy]$ ]] || { warn "已取消"; return 0; }
 
     if commit_stream_proxy_config \
-        "$front_domain" "$route_domain" "$api_upstream" "$stream_upstream" \
+        "$front_domain" "$route_domain" "$api_upstream" "$stream_upstream_list" \
         "$stream_prefix" "$site_id"; then
         echo -e "\n${GREEN}Hills 填写：${PLAIN}"
         echo -e "地址：https://$front_domain"
