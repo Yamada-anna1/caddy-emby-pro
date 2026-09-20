@@ -1556,7 +1556,7 @@ collect_discovery_entries() {
 
     while IFS= read -r domain; do
         [[ -n "$domain" ]] || continue
-        add_discovery_entry "auto" "$domain" "$domain" "[已发现推流] $domain"
+        add_discovery_entry "auto" "$domain" "$domain" "[单域名推流/待升级] $domain"
     done < <(awk '
         $1 == "#" && $2 == "BEGIN" && $3 == "CADDY_EMBY_AUTO_STREAM" { print $4 }
     ' "$CADDYFILE")
@@ -1840,33 +1840,41 @@ cleanup_discovery_runtime() {
 }
 
 
-commit_auto_stream_proxy_config() {
+commit_discovered_stream_proxy_config() {
     local selected_type="$1"
-    local domain="$2"
-    local api_upstream="$3"
-    local stream_upstream_list="$4"
-    local stream_prefix="$5"
-    local site_id="$6"
+    local front_domain="$2"
+    local route_domain="$3"
+    local api_upstream="$4"
+    local stream_upstream_list="$5"
+    local stream_prefix="$6"
+    local site_id="$7"
     local candidate config_block
 
     candidate="$(new_candidate_file)" || return 1
     case "$selected_type" in
+        stream)
+            remove_stream_group_file "$CADDYFILE" "$candidate" "$front_domain" || {
+                error "现有双域名推流组结构异常，未覆盖任何配置"
+                rm -f -- "$candidate"
+                return 1
+            }
+            ;;
         auto)
-            remove_auto_stream_group_file "$CADDYFILE" "$candidate" "$domain" || {
-                error "现有自动推流组结构异常，未覆盖任何配置"
+            remove_auto_stream_group_file "$CADDYFILE" "$candidate" "$front_domain" || {
+                error "现有单域名推流组结构异常，未覆盖任何配置"
                 rm -f -- "$candidate"
                 return 1
             }
             ;;
         managed)
-            remove_managed_site_file "$CADDYFILE" "$candidate" "$domain" || {
+            remove_managed_site_file "$CADDYFILE" "$candidate" "$front_domain" || {
                 error "现有普通站点标记不完整，未覆盖任何配置"
                 rm -f -- "$candidate"
                 return 1
             }
             ;;
         legacy)
-            remove_site_block_file "$CADDYFILE" "$candidate" "$domain" || {
+            remove_site_block_file "$CADDYFILE" "$candidate" "$front_domain" || {
                 error "现有旧版站点块结构异常，未覆盖任何配置"
                 rm -f -- "$candidate"
                 return 1
@@ -1878,12 +1886,17 @@ commit_auto_stream_proxy_config() {
             ;;
     esac
 
-    if ! ensure_domain_available_in_file "$candidate" "$domain" "入口域名"; then
+    if ! ensure_domain_available_in_file "$candidate" "$front_domain" "入口域名"; then
         rm -f -- "$candidate"
         return 1
     fi
-    config_block="$(build_auto_stream_config_block \
-        "$domain" "$api_upstream" "$stream_upstream_list" "$stream_prefix" "$site_id")"
+    if ! ensure_domain_available_in_file "$candidate" "$route_domain" "兼容线路域名"; then
+        rm -f -- "$candidate"
+        return 1
+    fi
+    config_block="$(build_stream_config_block \
+        "$front_domain" "$route_domain" "$api_upstream" "$stream_upstream_list" \
+        "$stream_prefix" "$site_id")"
     append_block_to_file "$candidate" "$config_block" || {
         rm -f -- "$candidate"
         return 1
@@ -1894,7 +1907,7 @@ commit_auto_stream_proxy_config() {
 
 find_stream_address() {
     local selection index=-1 i selected_type selected_key selected_domain selected_route
-    local discovered merged confirm site_id restore_status=0
+    local discovered merged confirm site_id restore_status=0 target_route_domain conflict_status
 
     echo -e "------------------------------------------------"
     echo -e "${SKYBLUE}查找推流地址并升级当前站点${PLAIN}"
@@ -1986,13 +1999,45 @@ find_stream_address() {
 
     echo -e "\n${GREEN}发现推流地址：${PLAIN}"
     tr ',' '\n' <<< "$discovered" | sed 's/^/  - /'
+
+    if [[ "$selected_type" == "stream" ]]; then
+        target_route_domain="$DISCOVERY_ROUTE_DOMAIN"
+        echo -e "继续使用现有兼容线路域名：https://$target_route_domain"
+    else
+        echo -e "\n${SKYBLUE}为发现的推流线路添加兼容域名${PLAIN}"
+        echo -e "该域名必须解析到本 VPS；客户端仍使用原入口域名，路径留空。"
+        read -r -p "请输入兼容线路域名（例如 line.example.com）: " target_route_domain < /dev/tty
+        [[ -n "$target_route_domain" ]] || { warn "已取消，原有站点未修改"; return 0; }
+        if ! validate_domain "$target_route_domain"; then
+            error "兼容线路域名格式无效；原有站点未修改"
+            return 1
+        fi
+        target_route_domain="${target_route_domain,,}"
+        if [[ "$target_route_domain" == "$selected_key" ]]; then
+            error "入口域名和兼容线路域名不能相同；原有站点未修改"
+            return 1
+        fi
+        if domain_conflict_in_file "$CADDYFILE" "$target_route_domain"; then
+            error "兼容线路域名 $target_route_domain 已被现有 Caddy 配置使用；原有站点未修改"
+            return 1
+        else
+            conflict_status=$?
+        fi
+        if (( conflict_status == 2 )); then
+            error "无法可靠检查兼容线路域名 $target_route_domain；原有站点未修改"
+            return 1
+        fi
+    fi
+
     echo -e "\n${YELLOW}即将覆盖站点：$selected_key${PLAIN}"
     if [[ -z "$DISCOVERY_EXISTING_STREAMS" ]]; then
-        warn "该站点原来没有推流域名；确认后将新增推流反代并替换原普通站点配置"
+        warn "该站点原来没有推流域名；确认后将替换为双域名前后端推流配置"
     else
         echo -e "现有推流上游：$DISCOVERY_EXISTING_STREAMS"
     fi
     [[ "$selected_domain" == "$selected_key" ]] || echo -e "本次检测入口：$selected_domain"
+    echo -e "客户端入口：https://$selected_key（端口 443，路径留空）"
+    echo -e "兼容线路：https://$target_route_domain"
     echo -e "API 上游：$DISCOVERY_API_UPSTREAM"
     echo -e "推流上游：$merged"
     echo -e "覆盖前脚本会备份并验证 Caddyfile；其他站点保持不变。"
@@ -2000,12 +2045,17 @@ find_stream_address() {
     [[ "$confirm" =~ ^[Yy]$ ]] || { warn "已取消，原有站点未修改"; return 0; }
 
     site_id="$(make_site_id "$selected_key")"
-    if [[ "$selected_type" == "stream" ]]; then
-        commit_stream_proxy_config "$selected_key" "$DISCOVERY_ROUTE_DOMAIN" \
-            "$DISCOVERY_API_UPSTREAM" "$merged" "$DISCOVERY_PREFIX" "$site_id"
+    if commit_discovered_stream_proxy_config "$selected_type" "$selected_key" \
+        "$target_route_domain" "$DISCOVERY_API_UPSTREAM" "$merged" \
+        "$DISCOVERY_PREFIX" "$site_id"; then
+        echo -e "\n${GREEN}客户端/播放器填写：${PLAIN}"
+        echo -e "地址：https://$selected_key"
+        echo -e "端口：443"
+        echo -e "路径：留空（不要填写 /）"
+        echo -e "兼容路径：/$target_route_domain"
+        echo -e "备用直连：https://$target_route_domain"
     else
-        commit_auto_stream_proxy_config "$selected_type" "$selected_key" \
-            "$DISCOVERY_API_UPSTREAM" "$merged" "$DISCOVERY_PREFIX" "$site_id"
+        return $?
     fi
 }
 

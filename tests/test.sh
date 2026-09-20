@@ -537,9 +537,39 @@ if command -v ln >/dev/null 2>&1; then
     [[ -L "$CADDYFILE" ]] || fail "dangling Caddyfile symlink was changed"
 fi
 
+reset_transaction_case "discovered-migration"
+build_standard_config_block \
+    "player.example.com" \
+    "https://api.example.com:443" > "$CADDYFILE"
+MOCK_CADDY_ADAPT_RC=0
+MOCK_ADAPTED_JSON='{"apps":{"http":{"servers":{"srv0":{"routes":[]}}}}}'
+CAPTURED_CANDIDATE=""
+apply_candidate() {
+    CAPTURED_CANDIDATE="$1"
+    return 37
+}
+if commit_discovered_stream_proxy_config \
+    "managed" \
+    "player.example.com" \
+    "line.example.com" \
+    "https://api.example.com:443" \
+    "https://stream.example.com:443" \
+    "__player_stream" \
+    "$(make_site_id "player.example.com")"; then
+    fail "discovered-site migration swallowed apply failure"
+else
+    apply_status=$?
+fi
+(( apply_status == 37 )) || fail "discovered-site migration did not propagate apply failure"
+[[ -n "$CAPTURED_CANDIDATE" && -f "$CAPTURED_CANDIDATE" ]] \
+    || fail "discovered-site migration did not generate a candidate"
+grep -Fq "$STREAM_BEGIN player.example.com line.example.com" "$CAPTURED_CANDIDATE" \
+    || fail "discovered-site migration did not create a standard dual-domain stream group"
+! grep -Fq "$SITE_BEGIN player.example.com" "$CAPTURED_CANDIDATE" \
+    || fail "discovered-site migration retained the old ordinary site block"
+
 reset_transaction_case "propagate-failure"
 rm -f "$CADDYFILE"
-apply_candidate() { return 37; }
 if commit_stream_proxy_config \
     "dao.example.com" \
     "db.example.com" \
