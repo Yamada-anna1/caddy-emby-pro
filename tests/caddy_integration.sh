@@ -22,6 +22,10 @@ export BACKUP_DIR="$TEST_TMP/backups"
 # shellcheck disable=SC1091
 source "$ROOT_DIR/install_caddy_emby.sh"
 
+if ! command -v sha256sum >/dev/null 2>&1 && command -v b2sum >/dev/null 2>&1; then
+    sha256sum() { b2sum "$@"; }
+fi
+
 mkdir -p "$CADDY_DIR"
 
 fail() {
@@ -30,6 +34,7 @@ fail() {
 }
 
 site_id="$(make_site_id "dao.example.com")"
+auto_site_id="$(make_site_id "player.example.com")"
 build_stream_config_block \
     "dao.example.com" \
     "db.example.com" \
@@ -41,6 +46,32 @@ build_stream_config_block \
 caddy fmt --overwrite "$CADDYFILE"
 caddy validate --config "$CADDYFILE" --adapter caddyfile
 
+diagnostic_source="$TEST_TMP/Caddyfile.discovery-source"
+diagnostic_candidate="$TEST_TMP/Caddyfile.discovery-candidate"
+diagnostic_existing_log="$TEST_TMP/existing-access.json"
+diagnostic_capture_log="$TEST_TMP/discovery-access.json"
+cat > "$diagnostic_source" <<EOF
+legacy.example.com {
+    log {
+        output file $diagnostic_existing_log
+        format json
+    }
+
+    reverse_proxy https://api.example.com {
+        header_down Location "(?i)^https?://stream[.]example[.]com(:[0-9]+)?/" "https://{http.request.host}/__legacy_stream/"
+    }
+}
+EOF
+inject_discovery_log_file "$diagnostic_source" "$diagnostic_candidate" "legacy" \
+    "legacy.example.com" "legacy.example.com" "$diagnostic_capture_log"
+caddy validate --config "$diagnostic_candidate" --adapter caddyfile
+! grep -Fq "$diagnostic_existing_log" "$diagnostic_candidate" \
+    || fail "diagnostic candidate retained the target site's existing access log"
+grep -Fq "$diagnostic_capture_log" "$diagnostic_candidate" \
+    || fail "diagnostic candidate did not install the temporary access log"
+! grep -Fq 'header_down Location' "$diagnostic_candidate" \
+    || fail "diagnostic candidate retained Location rewriting and hid the real stream origin"
+
 proxy_port="${CADDY_TEST_PROXY_PORT:-28080}"
 api_port="${CADDY_TEST_API_PORT:-28081}"
 stream_port="${CADDY_TEST_STREAM_PORT:-28082}"
@@ -48,6 +79,7 @@ stream_b_port="${CADDY_TEST_STREAM_B_PORT:-28083}"
 runtime_caddyfile="$TEST_TMP/Caddyfile.runtime"
 runtime_log="$TEST_TMP/caddy-runtime.log"
 second_prefix="$(stream_route_prefix '__dao_stream' 1 'localhost')"
+auto_second_prefix="$(stream_route_prefix '__player_stream' 1 'localhost')"
 
 {
     printf '%s\n' '{' '    admin off' '}' ''
@@ -61,6 +93,16 @@ second_prefix="$(stream_route_prefix '__dao_stream' 1 'localhost')"
         | sed \
             -e "s/^db[.]example[.]com {/http:\/\/db.example.com:$proxy_port {/" \
             -e "s/^dao[.]example[.]com {/http:\/\/dao.example.com:$proxy_port {/" \
+            -e 's#https://{http.request.host}/#http://{http.request.host}/#g'
+    printf '\n'
+    build_auto_stream_config_block \
+        "player.example.com" \
+        "http://127.0.0.1:$api_port" \
+        "http://127.0.0.1:$stream_port,http://localhost:$stream_b_port" \
+        "__player_stream" \
+        "$auto_site_id" \
+        | sed \
+            -e "s/^player[.]example[.]com {/http:\/\/player.example.com:$proxy_port {/" \
             -e 's#https://{http.request.host}/#http://{http.request.host}/#g'
     printf '\nhttp://127.0.0.1:%s {\n' "$api_port"
     printf '    @stream_a path /redirect/a\n'
@@ -81,6 +123,7 @@ CADDY_TEST_PID=$!
 
 front_resolve="dao.example.com:$proxy_port:127.0.0.1"
 route_resolve="db.example.com:$proxy_port:127.0.0.1"
+auto_resolve="player.example.com:$proxy_port:127.0.0.1"
 runtime_ready=false
 for _ in {1..50}; do
     if ! kill -0 "$CADDY_TEST_PID" 2>/dev/null; then
@@ -146,6 +189,31 @@ chain_headers="$(curl -sS --noproxy '*' --resolve "$front_resolve" \
 grep -Fqi "location: http://dao.example.com/__dao_stream/stream/final.mkv?sig=chain" \
     <<< "$chain_headers" \
     || fail "secondary stream redirect escaped the VPS"
+
+auto_root_response="$(curl -fsS --noproxy '*' --resolve "$auto_resolve" \
+    "http://player.example.com:$proxy_port/emby/System/Info/Public?token=auto")"
+[[ "$auto_root_response" == 'api /emby/System/Info/Public?token=auto' ]] \
+    || fail "auto-upgraded site root did not reach the API upstream unchanged"
+
+auto_redirect_headers="$(curl -sS --noproxy '*' --resolve "$auto_resolve" \
+    --max-redirs 0 -D - -o /dev/null \
+    "http://player.example.com:$proxy_port/redirect/a" | tr -d '\r')"
+grep -Fqi 'location: http://player.example.com/__player_stream/stream/a.mkv?sig=a' \
+    <<< "$auto_redirect_headers" \
+    || fail "auto-upgraded site did not rewrite the playback redirect"
+
+auto_stream_response="$(curl -fsS --noproxy '*' --resolve "$auto_resolve" \
+    -H 'Range: bytes=20-30' \
+    "http://player.example.com:$proxy_port/$auto_second_prefix/stream/file.mkv?sig=auto")"
+[[ "$auto_stream_response" == 'stream-b /stream/file.mkv?sig=auto range=bytes=20-30' ]] \
+    || fail "auto-upgraded site did not preserve the secondary stream Range or signature"
+
+auto_chain_headers="$(curl -sS --noproxy '*' --resolve "$auto_resolve" \
+    --max-redirs 0 -D - -o /dev/null \
+    "http://player.example.com:$proxy_port/$auto_second_prefix/hop-to-a" | tr -d '\r')"
+grep -Fqi 'location: http://player.example.com/__player_stream/stream/final.mkv?sig=chain' \
+    <<< "$auto_chain_headers" \
+    || fail "auto-upgraded site secondary redirect escaped the VPS"
 
 redirect_headers="$(curl -sS --noproxy '*' --resolve "$front_resolve" \
     --max-redirs 0 -D - -o /dev/null \

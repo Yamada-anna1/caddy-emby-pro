@@ -21,10 +21,15 @@ CADDYFILE="${CADDYFILE:-$CADDY_DIR/Caddyfile}"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/caddy-emby-pro}"
 STREAM_BEGIN="# BEGIN CADDY_EMBY_STREAM"
 STREAM_END="# END CADDY_EMBY_STREAM"
+AUTO_STREAM_BEGIN="# BEGIN CADDY_EMBY_AUTO_STREAM"
+AUTO_STREAM_END="# END CADDY_EMBY_AUTO_STREAM"
 SITE_BEGIN="# BEGIN CADDY_EMBY_SITE"
 SITE_END="# END CADDY_EMBY_SITE"
 
 LAST_BACKUP=""
+DISCOVERY_RUNTIME_CHANGED=false
+DISCOVERY_CANDIDATE=""
+DISCOVERY_LOG_FILE=""
 
 log()   { echo -e "${GREEN}[Info]${PLAIN} $1"; }
 warn()  { echo -e "${YELLOW}[Warning]${PLAIN} $1"; }
@@ -220,7 +225,7 @@ default_stream_prefix() {
 
 
 valid_menu_choice() {
-    [[ "$1" =~ ^(10|[0-9])$ ]]
+    [[ "$1" =~ ^(10|11|[0-9])$ ]]
 }
 
 
@@ -762,7 +767,7 @@ check_managed_markers() {
 
     awk '
         function fail() { bad=1 }
-        $1 == "#" && $2 == "BEGIN" && ($3 == "CADDY_EMBY_STREAM" || $3 == "CADDY_EMBY_SITE") {
+        $1 == "#" && $2 == "BEGIN" && ($3 == "CADDY_EMBY_STREAM" || $3 == "CADDY_EMBY_AUTO_STREAM" || $3 == "CADDY_EMBY_SITE") {
             type=$3
             key=$4
             if (open_type != "" || key == "" || seen[type SUBSEP key]++) fail()
@@ -770,7 +775,7 @@ check_managed_markers() {
             open_key=key
             next
         }
-        $1 == "#" && $2 == "END" && ($3 == "CADDY_EMBY_STREAM" || $3 == "CADDY_EMBY_SITE") {
+        $1 == "#" && $2 == "END" && ($3 == "CADDY_EMBY_STREAM" || $3 == "CADDY_EMBY_AUTO_STREAM" || $3 == "CADDY_EMBY_SITE") {
             if (open_type == "" || $3 != open_type || $4 != open_key) fail()
             open_type=""
             open_key=""
@@ -791,6 +796,27 @@ remove_stream_group_file() {
 
     awk -v begin="$STREAM_BEGIN $front_domain " -v end="$STREAM_END $front_domain" '
         index($0, begin) == 1 {
+            if (skip || found) err=1
+            skip=1
+            found=1
+            next
+        }
+        skip && $0 == end { skip=0; next }
+        !skip { print }
+        END {
+            if (skip || !found || err) exit 42
+        }
+    ' "$source_file" > "$output_file"
+}
+
+
+remove_auto_stream_group_file() {
+    local source_file="$1"
+    local output_file="$2"
+    local domain="$3"
+
+    awk -v begin="$AUTO_STREAM_BEGIN $domain" -v end="$AUTO_STREAM_END $domain" '
+        $0 == begin {
             if (skip || found) err=1
             skip=1
             found=1
@@ -862,6 +888,12 @@ remove_site_block_file() {
 stream_group_exists() {
     local front_domain="$1"
     [[ -f "$CADDYFILE" ]] && grep -Fqx "$STREAM_END $front_domain" "$CADDYFILE"
+}
+
+
+auto_stream_group_exists() {
+    local domain="$1"
+    [[ -f "$CADDYFILE" ]] && grep -Fqx "$AUTO_STREAM_END $domain" "$CADDYFILE"
 }
 
 
@@ -975,7 +1007,7 @@ domain_in_stream_group() {
     local domain="$1"
     [[ -f "$CADDYFILE" ]] || return 1
     awk -v target="$domain" '
-        $1 == "#" && $2 == "BEGIN" && $3 == "CADDY_EMBY_STREAM" {
+        $1 == "#" && $2 == "BEGIN" && ($3 == "CADDY_EMBY_STREAM" || $3 == "CADDY_EMBY_AUTO_STREAM") {
             if ($4 == target || $5 == target) found=1
         }
         END { exit(found ? 0 : 1) }
@@ -1080,6 +1112,67 @@ build_stream_config_block() {
 }
 
 
+build_auto_stream_config_block() {
+    local domain="$1"
+    local api_upstream="$2"
+    local stream_upstream_list="$3"
+    local stream_prefix="$4"
+    local site_id="$5"
+    local api_host stream_host route_prefix snippet_name
+    local index target_index
+    local -a stream_upstreams=() stream_hosts=() stream_regexes=()
+    local -a route_prefixes=() snippet_names=()
+
+    api_host="$(extract_url_host "$api_upstream")"
+    IFS=',' read -r -a stream_upstreams <<< "$stream_upstream_list"
+    for index in "${!stream_upstreams[@]}"; do
+        stream_host="$(extract_url_host "${stream_upstreams[$index]}")"
+        stream_hosts+=("$stream_host")
+        stream_regexes+=("${stream_host//./[.]}")
+        route_prefix="$(stream_route_prefix "$stream_prefix" "$index" "$stream_host")"
+        route_prefixes+=("$route_prefix")
+        if (( ${#stream_upstreams[@]} == 1 )); then
+            snippet_names+=("${site_id}_stream")
+        else
+            snippet_names+=("${site_id}_stream_$((index + 1))")
+        fi
+    done
+
+    printf '%s\n' "$AUTO_STREAM_BEGIN $domain"
+    printf '(%s_api) {\n' "$site_id"
+    printf '    reverse_proxy %s {\n' "$api_upstream"
+    printf '        header_up Host %s\n' "$api_host"
+    printf '        header_up -X-Forwarded-Host\n\n'
+    for index in "${!stream_upstreams[@]}"; do
+        printf '        header_down Location "(?i)^https?://%s(:[0-9]+)?/" "https://{http.request.host}/%s/"\n' \
+            "${stream_regexes[$index]}" "${route_prefixes[$index]}"
+    done
+    printf '    }\n}\n'
+
+    for index in "${!stream_upstreams[@]}"; do
+        snippet_name="${snippet_names[$index]}"
+        printf '\n(%s) {\n' "$snippet_name"
+        printf '    reverse_proxy %s {\n' "${stream_upstreams[$index]}"
+        printf '        header_up Host %s\n' "${stream_hosts[$index]}"
+        printf '        header_up -X-Forwarded-Host\n\n'
+        for target_index in "${!stream_upstreams[@]}"; do
+            printf '        header_down Location "(?i)^https?://%s(:[0-9]+)?/" "https://{http.request.host}/%s/"\n' \
+                "${stream_regexes[$target_index]}" "${route_prefixes[$target_index]}"
+        done
+        printf '    }\n}\n'
+    done
+
+    printf '\n%s {\n' "$domain"
+    for index in "${!stream_upstreams[@]}"; do
+        printf '    handle_path /%s/* {\n' "${route_prefixes[$index]}"
+        printf '        import %s\n' "${snippet_names[$index]}"
+        printf '    }\n\n'
+    done
+    printf '    handle {\n        import %s_api\n    }\n}\n' "$site_id"
+    printf '%s\n' "$AUTO_STREAM_END $domain"
+}
+
+
 append_block_to_file() {
     local file="$1"
     local block="$2"
@@ -1113,7 +1206,7 @@ check_port() {
         ss -tulpn | grep -E ':80|:443' || true
     fi
     echo -e "------------------------------------------------"
-    echo -e "如果显示 nginx/apache，请使用菜单 [9] 清理。"
+    echo -e "如果显示 nginx/apache，请使用菜单 [10] 清理。"
     echo -e "如果显示 caddy，属正常现象。"
 }
 
@@ -1434,6 +1527,489 @@ configure_stream_proxy() {
 }
 
 
+add_discovery_entry() {
+    DISCOVERY_TYPES+=("$1")
+    DISCOVERY_KEYS+=("$2")
+    DISCOVERY_DOMAINS+=("$3")
+    DISCOVERY_LABELS+=("$4")
+    DISCOVERY_ROUTES+=("${5:-}")
+}
+
+
+collect_discovery_entries() {
+    local front route domain
+    DISCOVERY_TYPES=()
+    DISCOVERY_KEYS=()
+    DISCOVERY_DOMAINS=()
+    DISCOVERY_LABELS=()
+    DISCOVERY_ROUTES=()
+
+    while IFS=$'\t' read -r front route; do
+        [[ -n "$front" && -n "$route" ]] || continue
+        add_discovery_entry "stream" "$front" "$front" "[推流入口] $front" "$route"
+        add_discovery_entry "stream" "$front" "$route" "[兼容入口] $route（组：$front）" "$route"
+    done < <(awk '
+        $1 == "#" && $2 == "BEGIN" && $3 == "CADDY_EMBY_STREAM" {
+            print $4 "\t" $5
+        }
+    ' "$CADDYFILE")
+
+    while IFS= read -r domain; do
+        [[ -n "$domain" ]] || continue
+        add_discovery_entry "auto" "$domain" "$domain" "[已发现推流] $domain"
+    done < <(awk '
+        $1 == "#" && $2 == "BEGIN" && $3 == "CADDY_EMBY_AUTO_STREAM" { print $4 }
+    ' "$CADDYFILE")
+
+    while IFS= read -r domain; do
+        [[ -n "$domain" ]] || continue
+        add_discovery_entry "managed" "$domain" "$domain" "[普通] $domain"
+    done < <(awk '
+        $1 == "#" && $2 == "BEGIN" && $3 == "CADDY_EMBY_SITE" { print $4 }
+    ' "$CADDYFILE")
+
+    while IFS= read -r domain; do
+        [[ -n "$domain" ]] || continue
+        add_discovery_entry "legacy" "$domain" "$domain" "[普通/旧版] $domain"
+    done < <(awk '
+        /^# BEGIN CADDY_EMBY_/ { managed=1; next }
+        /^# END CADDY_EMBY_/   { managed=0; next }
+        !managed && /^[a-zA-Z0-9.-]+[[:space:]]*\{$/ {
+            line=$0
+            sub(/[[:space:]]*\{$/, "", line)
+            print line
+        }
+    ' "$CADDYFILE")
+}
+
+
+extract_marked_reverse_proxies() {
+    local marker="$1"
+    local key="$2"
+
+    awk -v marker="$marker" -v key="$key" '
+        $1 == "#" && $2 == "BEGIN" && $3 == marker && $4 == key { inside=1; next }
+        inside && $1 == "#" && $2 == "END" && $3 == marker && $4 == key { exit }
+        inside && $1 == "reverse_proxy" { print $2 }
+    ' "$CADDYFILE"
+}
+
+
+extract_marked_stream_prefix() {
+    local marker="$1"
+    local key="$2"
+
+    awk -v marker="$marker" -v key="$key" '
+        $1 == "#" && $2 == "BEGIN" && $3 == marker && $4 == key { inside=1; next }
+        inside && $1 == "#" && $2 == "END" && $3 == marker && $4 == key { exit }
+        inside && $1 == "header_down" && $2 == "Location" {
+            needle="https://{http.request.host}/"
+            start=index($0, needle)
+            if (start > 0) {
+                value=substr($0, start + length(needle))
+                sub(/\/.*/, "", value)
+                if (value != "") { print value; exit }
+            }
+        }
+    ' "$CADDYFILE"
+}
+
+
+extract_legacy_reverse_proxies() {
+    local domain="$1"
+
+    awk -v target="$domain" '
+        function opens(line, copy)  { copy=line; return gsub(/\{/, "", copy) }
+        function closes(line, copy) { copy=line; return gsub(/\}/, "", copy) }
+        !inside && $0 == target " {" {
+            inside=1
+            depth=opens($0)-closes($0)
+            next
+        }
+        inside {
+            if ($1 == "reverse_proxy") print $2
+            depth += opens($0)-closes($0)
+            if (depth <= 0) exit
+        }
+    ' "$CADDYFILE"
+}
+
+
+extract_discovery_metadata() {
+    local type="$1"
+    local key="$2"
+    local route="$3"
+    local -a proxies=()
+
+    case "$type" in
+        stream)
+            mapfile -t proxies < <(extract_marked_reverse_proxies "CADDY_EMBY_STREAM" "$key")
+            DISCOVERY_ROUTE_DOMAIN="$route"
+            ;;
+        auto)
+            mapfile -t proxies < <(extract_marked_reverse_proxies "CADDY_EMBY_AUTO_STREAM" "$key")
+            DISCOVERY_ROUTE_DOMAIN=""
+            ;;
+        managed)
+            mapfile -t proxies < <(extract_marked_reverse_proxies "CADDY_EMBY_SITE" "$key")
+            DISCOVERY_ROUTE_DOMAIN=""
+            ;;
+        legacy)
+            mapfile -t proxies < <(extract_legacy_reverse_proxies "$key")
+            DISCOVERY_ROUTE_DOMAIN=""
+            ;;
+        *) return 1 ;;
+    esac
+
+    (( ${#proxies[@]} > 0 )) || return 1
+    DISCOVERY_API_UPSTREAM="${proxies[0]}"
+    DISCOVERY_EXISTING_STREAMS=""
+    if (( ${#proxies[@]} > 1 )); then
+        DISCOVERY_EXISTING_STREAMS="$(IFS=','; printf '%s' "${proxies[*]:1}")"
+    fi
+    case "$type" in
+        stream)
+            DISCOVERY_PREFIX="$(extract_marked_stream_prefix "CADDY_EMBY_STREAM" "$key")"
+            ;;
+        auto)
+            DISCOVERY_PREFIX="$(extract_marked_stream_prefix "CADDY_EMBY_AUTO_STREAM" "$key")"
+            ;;
+        *)
+            DISCOVERY_PREFIX=""
+            ;;
+    esac
+    [[ -n "$DISCOVERY_PREFIX" ]] || DISCOVERY_PREFIX="$(default_stream_prefix "$key")"
+}
+
+
+inject_discovery_log_file() {
+    local source_file="$1"
+    local output_file="$2"
+    local type="$3"
+    local key="$4"
+    local target_domain="$5"
+    local log_file="$6"
+    local marker=""
+
+    case "$type" in
+        stream)  marker="CADDY_EMBY_STREAM" ;;
+        auto)    marker="CADDY_EMBY_AUTO_STREAM" ;;
+        managed) marker="CADDY_EMBY_SITE" ;;
+    esac
+
+    awk -v type="$type" -v marker="$marker" -v key="$key" \
+        -v target="$target_domain" -v logfile="$log_file" '
+        function opens(line, copy)  { copy=line; return gsub(/\{/, "", copy) }
+        function closes(line, copy) { copy=line; return gsub(/\}/, "", copy) }
+        function delta(line)        { return opens(line)-closes(line) }
+        function emit_log() {
+            print "    log discover_stream_address {"
+            print "        output file " logfile " {"
+            print "            roll_disabled"
+            print "        }"
+            print "        format json"
+            print "    }"
+            print ""
+        }
+        type != "legacy" && $1 == "#" && $2 == "BEGIN" && $3 == marker && $4 == key {
+            scoped=1
+        }
+        type != "legacy" && scoped && $1 == "#" && $2 == "END" && $3 == marker && $4 == key {
+            scoped=0
+        }
+        type == "legacy" && !scoped && $0 == target " {" {
+            scoped=1
+        }
+        scoped && $1 == "header_down" && $2 == "Location" { next }
+
+        scoped && $0 == target " {" {
+            print
+            emit_log()
+            inserted++
+            target_site=1
+            site_depth=delta($0)
+            next
+        }
+
+        target_site {
+            line_delta=delta($0)
+            if (skip_log) {
+                log_depth += line_delta
+                site_depth += line_delta
+                if (log_depth <= 0) skip_log=0
+                if (site_depth <= 0) {
+                    target_site=0
+                    if (type == "legacy") scoped=0
+                }
+                next
+            }
+
+            if (site_depth == 1 && $1 == "log") {
+                site_depth += line_delta
+                if (line_delta > 0) {
+                    skip_log=1
+                    log_depth=line_delta
+                }
+                next
+            }
+
+            print
+            site_depth += line_delta
+            if (site_depth <= 0) {
+                target_site=0
+                if (type == "legacy") scoped=0
+            }
+            next
+        }
+
+        { print }
+        END { if (inserted != 1) exit 42 }
+    ' "$source_file" > "$output_file"
+}
+
+
+merge_stream_upstream_lists() {
+    local existing="$1"
+    local discovered="$2"
+    local item normalized host seen_host
+    local -a items=() merged=() seen=()
+
+    IFS=',' read -r -a items <<< "${existing:+$existing,}$discovered"
+    for item in "${items[@]}"; do
+        [[ -n "$item" ]] || continue
+        normalized="$(trim_whitespace "$item")"
+        normalized="${normalized%/}"
+        validate_upstream_url "$normalized" || return 1
+        host="${normalized#*://}"
+        host="${host%%/*}"
+        host="${host%%:*}"
+        host="${host,,}"
+        for seen_host in "${seen[@]}"; do
+            [[ "$seen_host" != "$host" ]] || { host=""; break; }
+        done
+        [[ -n "$host" ]] || continue
+        seen+=("$host")
+        merged+=("$normalized")
+        (( ${#merged[@]} <= 8 )) || return 1
+    done
+    (( ${#merged[@]} > 0 )) || return 1
+    (IFS=','; printf '%s\n' "${merged[*]}")
+}
+
+
+discover_origins_from_log() {
+    local log_file="$1"
+    local excluded_domains="$2"
+
+    jq -Rr --arg excluded ",${excluded_domains,,}," '
+        fromjson?
+        | select((.status // 0) >= 300 and (.status // 0) < 400)
+        | (.resp_headers.Location[0] // .resp_headers.location[0] // empty)
+        | try capture("^(?<scheme>https?)://(?<authority>[^/]+)") catch empty
+        | (.authority | split(":")[0] | ascii_downcase) as $host
+        | select(($excluded | contains("," + $host + ",")) | not)
+        | "\(.scheme | ascii_downcase)://\(.authority | ascii_downcase)"
+    ' "$log_file" | awk '
+        NF && !seen[$0]++ {
+            if (count++) printf ","
+            printf "%s", $0
+        }
+        END { if (count) print "" }
+    '
+}
+
+
+cleanup_discovery_runtime() {
+    local restore_status=0
+
+    if [[ "$DISCOVERY_RUNTIME_CHANGED" == "true" && -f "$CADDYFILE" ]]; then
+        if ! caddy reload --config "$CADDYFILE" --adapter caddyfile; then
+            error "严重：临时诊断结束后无法恢复正式运行配置，请立即执行 systemctl restart caddy"
+            restore_status=1
+        fi
+    fi
+    if (( restore_status != 0 )); then
+        return "$restore_status"
+    fi
+    DISCOVERY_RUNTIME_CHANGED=false
+    [[ -z "$DISCOVERY_CANDIDATE" ]] || rm -f -- "$DISCOVERY_CANDIDATE"
+    [[ -z "$DISCOVERY_LOG_FILE" ]] || rm -f -- "$DISCOVERY_LOG_FILE"
+    DISCOVERY_CANDIDATE=""
+    DISCOVERY_LOG_FILE=""
+    return "$restore_status"
+}
+
+
+commit_auto_stream_proxy_config() {
+    local selected_type="$1"
+    local domain="$2"
+    local api_upstream="$3"
+    local stream_upstream_list="$4"
+    local stream_prefix="$5"
+    local site_id="$6"
+    local candidate config_block
+
+    candidate="$(new_candidate_file)" || return 1
+    case "$selected_type" in
+        auto)
+            remove_auto_stream_group_file "$CADDYFILE" "$candidate" "$domain" || {
+                error "现有自动推流组结构异常，未覆盖任何配置"
+                rm -f -- "$candidate"
+                return 1
+            }
+            ;;
+        managed)
+            remove_managed_site_file "$CADDYFILE" "$candidate" "$domain" || {
+                error "现有普通站点标记不完整，未覆盖任何配置"
+                rm -f -- "$candidate"
+                return 1
+            }
+            ;;
+        legacy)
+            remove_site_block_file "$CADDYFILE" "$candidate" "$domain" || {
+                error "现有旧版站点块结构异常，未覆盖任何配置"
+                rm -f -- "$candidate"
+                return 1
+            }
+            ;;
+        *)
+            rm -f -- "$candidate"
+            return 1
+            ;;
+    esac
+
+    if ! ensure_domain_available_in_file "$candidate" "$domain" "入口域名"; then
+        rm -f -- "$candidate"
+        return 1
+    fi
+    config_block="$(build_auto_stream_config_block \
+        "$domain" "$api_upstream" "$stream_upstream_list" "$stream_prefix" "$site_id")"
+    append_block_to_file "$candidate" "$config_block" || {
+        rm -f -- "$candidate"
+        return 1
+    }
+    apply_candidate "$candidate"
+}
+
+
+find_stream_address() {
+    local selection index=-1 i selected_type selected_key selected_domain selected_route
+    local discovered merged confirm site_id restore_status=0
+
+    echo -e "------------------------------------------------"
+    echo -e "${SKYBLUE}查找推流地址并升级当前站点${PLAIN}"
+    echo -e "------------------------------------------------"
+
+    [[ -s "$CADDYFILE" ]] || { error "未找到有效的 Caddyfile"; return 1; }
+    check_managed_markers "$CADDYFILE" || {
+        error "Caddyfile 中的托管标记缺失、嵌套或重复，已拒绝自动操作"
+        return 1
+    }
+    caddy_service_is_healthy || {
+        error "Caddy 当前未正常运行，无法抓取播放响应"
+        return 1
+    }
+
+    collect_discovery_entries
+    (( ${#DISCOVERY_KEYS[@]} > 0 )) || { warn "没有找到可检测的站点"; return 0; }
+    echo -e "选择播放器当前使用的站点："
+    for i in "${!DISCOVERY_KEYS[@]}"; do
+        echo -e " ${GREEN}$((i + 1)).${PLAIN} ${DISCOVERY_LABELS[$i]}"
+    done
+    read -r -p "请输入编号或完整域名: " selection < /dev/tty
+    [[ -n "$selection" ]] || return 0
+    if [[ "$selection" =~ ^[0-9]+$ ]]; then
+        (( selection >= 1 && selection <= ${#DISCOVERY_KEYS[@]} )) && index=$((selection - 1))
+    else
+        for i in "${!DISCOVERY_DOMAINS[@]}"; do
+            [[ "${DISCOVERY_DOMAINS[$i]}" == "${selection,,}" ]] && { index="$i"; break; }
+        done
+    fi
+    (( index >= 0 )) || { error "无效的编号或域名"; return 1; }
+
+    selected_type="${DISCOVERY_TYPES[$index]}"
+    selected_key="${DISCOVERY_KEYS[$index]}"
+    selected_domain="${DISCOVERY_DOMAINS[$index]}"
+    selected_route="${DISCOVERY_ROUTES[$index]}"
+    extract_discovery_metadata "$selected_type" "$selected_key" "$selected_route" || {
+        error "无法从现有站点提取唯一的 API 上游"
+        return 1
+    }
+    validate_backend "$DISCOVERY_API_UPSTREAM" || {
+        error "现有 API 上游格式不受自动升级支持：$DISCOVERY_API_UPSTREAM"
+        return 1
+    }
+
+    install -d -o caddy -g caddy -m 0700 /var/log/caddy-emby-pro || return 1
+    DISCOVERY_LOG_FILE="/var/log/caddy-emby-pro/discover-${selected_domain//[^a-zA-Z0-9.-]/_}-$$.json"
+    install -o caddy -g caddy -m 0600 /dev/null "$DISCOVERY_LOG_FILE" || return 1
+    DISCOVERY_CANDIDATE="$(new_candidate_file)" || { cleanup_discovery_runtime; return 1; }
+    inject_discovery_log_file "$CADDYFILE" "$DISCOVERY_CANDIDATE" \
+        "$selected_type" "$selected_key" "$selected_domain" "$DISCOVERY_LOG_FILE" || {
+        error "无法为所选站点生成临时访问日志配置"
+        cleanup_discovery_runtime
+        return 1
+    }
+    caddy fmt --overwrite "$DISCOVERY_CANDIDATE" || { cleanup_discovery_runtime; return 1; }
+    caddy validate --config "$DISCOVERY_CANDIDATE" --adapter caddyfile || {
+        error "临时诊断配置验证失败，正式配置未修改"
+        cleanup_discovery_runtime
+        return 1
+    }
+
+    trap 'cleanup_discovery_runtime; trap - INT TERM; return 130' INT TERM
+    DISCOVERY_RUNTIME_CHANGED=true
+    if ! caddy reload --config "$DISCOVERY_CANDIDATE" --adapter caddyfile; then
+        error "无法加载临时诊断配置，正式 Caddyfile 未修改"
+        cleanup_discovery_runtime
+        trap - INT TERM
+        return 1
+    fi
+    echo -e "\n${YELLOW}请在客户端选择 https://$selected_domain 并播放到失败。${PLAIN}"
+    echo -e "可以连续尝试多个视频；完成后回到这里按回车。"
+    read -r -p "准备好后按回车开始分析..." < /dev/tty
+
+    discovered="$(discover_origins_from_log "$DISCOVERY_LOG_FILE" \
+        "$selected_key${DISCOVERY_ROUTE_DOMAIN:+,$DISCOVERY_ROUTE_DOMAIN}")"
+    cleanup_discovery_runtime || restore_status=$?
+    trap - INT TERM
+    (( restore_status == 0 )) || return "$restore_status"
+    [[ -n "$discovered" ]] || {
+        error "没有捕获到绝对地址形式的 302 推流域名；未覆盖现有站点"
+        warn "请确认播放操作发生在所选站点，并且确实出现播放失败"
+        return 1
+    }
+    merged="$(merge_stream_upstream_lists "$DISCOVERY_EXISTING_STREAMS" "$discovered")" || {
+        error "发现的节点与现有节点合并失败或超过 8 个；未覆盖现有站点"
+        return 1
+    }
+
+    echo -e "\n${GREEN}发现推流地址：${PLAIN}"
+    tr ',' '\n' <<< "$discovered" | sed 's/^/  - /'
+    echo -e "\n${YELLOW}即将覆盖站点：$selected_key${PLAIN}"
+    if [[ -z "$DISCOVERY_EXISTING_STREAMS" ]]; then
+        warn "该站点原来没有推流域名；确认后将新增推流反代并替换原普通站点配置"
+    else
+        echo -e "现有推流上游：$DISCOVERY_EXISTING_STREAMS"
+    fi
+    [[ "$selected_domain" == "$selected_key" ]] || echo -e "本次检测入口：$selected_domain"
+    echo -e "API 上游：$DISCOVERY_API_UPSTREAM"
+    echo -e "推流上游：$merged"
+    echo -e "覆盖前脚本会备份并验证 Caddyfile；其他站点保持不变。"
+    read -r -p "确认覆盖并启用推流反代？[y/N]: " confirm < /dev/tty
+    [[ "$confirm" =~ ^[Yy]$ ]] || { warn "已取消，原有站点未修改"; return 0; }
+
+    site_id="$(make_site_id "$selected_key")"
+    if [[ "$selected_type" == "stream" ]]; then
+        commit_stream_proxy_config "$selected_key" "$DISCOVERY_ROUTE_DOMAIN" \
+            "$DISCOVERY_API_UPSTREAM" "$merged" "$DISCOVERY_PREFIX" "$site_id"
+    else
+        commit_auto_stream_proxy_config "$selected_type" "$selected_key" \
+            "$DISCOVERY_API_UPSTREAM" "$merged" "$DISCOVERY_PREFIX" "$site_id"
+    fi
+}
+
+
 add_delete_entry() {
     local type="$1"
     local key="$2"
@@ -1464,6 +2040,13 @@ collect_delete_entries() {
         $1 == "#" && $2 == "BEGIN" && $3 == "CADDY_EMBY_STREAM" {
             print $4 "\t" $5
         }
+    ' "$CADDYFILE")
+
+    while IFS= read -r domain; do
+        [[ -n "$domain" ]] || continue
+        add_delete_entry "auto" "$domain" "[自动推流] $domain" ""
+    done < <(awk '
+        $1 == "#" && $2 == "BEGIN" && $3 == "CADDY_EMBY_AUTO_STREAM" { print $4 }
     ' "$CADDYFILE")
 
     while IFS= read -r domain; do
@@ -1559,6 +2142,13 @@ delete_config() {
         stream)
             remove_stream_group_file "$CADDYFILE" "$candidate" "$selected_key" || {
                 error "推流组标记不完整，未删除任何配置"
+                rm -f -- "$candidate"
+                return 1
+            }
+            ;;
+        auto)
+            remove_auto_stream_group_file "$CADDYFILE" "$candidate" "$selected_key" || {
+                error "自动推流组标记不完整，未删除任何配置"
                 rm -f -- "$candidate"
                 return 1
             }
@@ -1660,19 +2250,20 @@ show_menu() {
     echo -e " ${GREEN}3.${PLAIN} 添加/覆盖 前后端反代推流配置（支持多站）"
     echo -e " ${GREEN}4.${PLAIN} 删除指定站点配置"
     echo -e " ${GREEN}5.${PLAIN} 查看 Caddy 配置文件"
+    echo -e " ${GREEN}6.${PLAIN} 查找推流地址并覆盖当前站点"
     echo -e "------------------------------------------------------------"
-    echo -e " ${GREEN}6.${PLAIN} 停止 Caddy"
-    echo -e " ${GREEN}7.${PLAIN} 重启 Caddy"
-    echo -e " ${GREEN}8.${PLAIN} 查询 443/80 端口占用"
-    echo -e " ${RED}9.${PLAIN} 强制处理端口占用（修复启动失败）"
-    echo -e " ${RED}10.${PLAIN} 卸载 Caddy"
+    echo -e " ${GREEN}7.${PLAIN} 停止 Caddy"
+    echo -e " ${GREEN}8.${PLAIN} 重启 Caddy"
+    echo -e " ${GREEN}9.${PLAIN} 查询 443/80 端口占用"
+    echo -e " ${RED}10.${PLAIN} 强制处理端口占用（修复启动失败）"
+    echo -e " ${RED}11.${PLAIN} 卸载 Caddy"
     echo -e "------------------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 退出脚本"
     echo -e ""
-    read -r -p " 请输入数字 [0-10]: " num < /dev/tty
+    read -r -p " 请输入数字 [0-11]: " num < /dev/tty
 
     if ! valid_menu_choice "$num"; then
-        error "请输入有效的数字（0-10）"
+        error "请输入有效的数字（0-11）"
         return 1
     fi
 
@@ -1688,7 +2279,8 @@ show_menu() {
                 warn "Caddyfile 不存在"
             fi
             ;;
-        6)
+        6) install_base; find_stream_address ;;
+        7)
             if systemctl is-active --quiet caddy; then
                 systemctl stop caddy
                 log "服务已停止"
@@ -1696,10 +2288,10 @@ show_menu() {
                 warn "Caddy 服务未运行"
             fi
             ;;
-        7) restart_caddy ;;
-        8) install_base; check_port ;;
-        9) install_base; kill_port ;;
-        10) uninstall_caddy ;;
+        8) restart_caddy ;;
+        9) install_base; check_port ;;
+        10) install_base; kill_port ;;
+        11) uninstall_caddy ;;
         0) exit 0 ;;
     esac
 }

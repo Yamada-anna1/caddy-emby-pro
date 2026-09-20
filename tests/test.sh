@@ -13,6 +13,32 @@ export BACKUP_DIR="$TEST_TMP/backups"
 # shellcheck disable=SC1091
 source "$ROOT_DIR/install_caddy_emby.sh"
 
+# The trimmed Git-for-Windows test runtime exposes b2sum but not sha256sum.
+# Linux/CI keeps using sha256sum; this fallback only makes local unit tests portable.
+if ! command -v sha256sum >/dev/null 2>&1 && command -v b2sum >/dev/null 2>&1; then
+    sha256sum() { b2sum "$@"; }
+fi
+if ! command -v stat >/dev/null 2>&1; then
+    stat() {
+        [[ "${1-}" == "-c" && "${2-}" == "%d" ]] || return 1
+        printf '1\n'
+    }
+fi
+if ! command -v install >/dev/null 2>&1; then
+    install() {
+        local destination="${*: -1}"
+        [[ " $* " == *" -d "* ]] || return 1
+        mkdir -p -- "$destination"
+    }
+fi
+if ! command -v chmod >/dev/null 2>&1; then
+    chmod() { return 0; }
+fi
+if ! command -v chown >/dev/null 2>&1; then
+    # shellcheck disable=SC2317 # Invoked indirectly by apply_candidate.
+    chown() { return 0; }
+fi
+
 mkdir -p "$CADDY_DIR"
 
 fail() {
@@ -37,8 +63,8 @@ validate_upstream_url "https://stream.example.com:443" || fail "valid upstream r
     || fail "duplicate stream host was accepted"
 ! normalize_stream_upstream_list 'https://stream.example.com/path' >/dev/null \
     || fail "stream upstream path was accepted"
-valid_menu_choice 10 || fail "menu choice 10 rejected"
-! valid_menu_choice 11 || fail "menu choice 11 accepted"
+valid_menu_choice 11 || fail "menu choice 11 rejected"
+! valid_menu_choice 12 || fail "menu choice 12 accepted"
 
 site_id="$(make_site_id "dao.example.com")"
 [[ "$site_id" == "$(make_site_id "dao.example.com")" ]] || fail "site id is not stable"
@@ -91,9 +117,30 @@ assert_contains "$multi_block" "    handle_path /$second_prefix/* {
 [[ "$(grep -Fc "handle_path /$second_prefix/*" <<< "$multi_block")" == 2 ]] \
     || fail "second stream handler was not installed on both public domains"
 
+auto_block="$(build_auto_stream_config_block \
+    "player.example.com" \
+    "https://api.example.com:443" \
+    "https://stream-a.example.com:443,https://stream-b.example.com:443" \
+    "__player_stream" \
+    "$(make_site_id "player.example.com")")"
+assert_contains "$auto_block" "$AUTO_STREAM_BEGIN player.example.com"
+assert_contains "$auto_block" "player.example.com {"
+assert_contains "$auto_block" "handle_path /__player_stream/*"
+assert_contains "$auto_block" 'header_down Location "(?i)^https?://stream-a[.]example[.]com(:[0-9]+)?/"'
+assert_contains "$auto_block" "$AUTO_STREAM_END player.example.com"
+
 printf '%s\n\n%s\n' "$block" 'keep.example.com {' > "$CADDYFILE"
 printf '%s\n' '    reverse_proxy 127.0.0.1:8096' '}' >> "$CADDYFILE"
 check_managed_markers "$CADDYFILE" || fail "valid markers rejected"
+
+printf '\n%s\n' "$auto_block" >> "$CADDYFILE"
+check_managed_markers "$CADDYFILE" || fail "auto stream markers rejected"
+
+without_auto="$TEST_TMP/without-auto"
+remove_auto_stream_group_file "$CADDYFILE" "$without_auto" "player.example.com" \
+    || fail "auto stream group removal failed"
+! grep -Fq "player.example.com" "$without_auto" || fail "auto stream group remained"
+grep -Fq "dao.example.com" "$without_auto" || fail "unrelated stream group removed"
 
 without_stream="$TEST_TMP/without-stream"
 remove_stream_group_file "$CADDYFILE" "$without_stream" "dao.example.com" || fail "stream group removal failed"
@@ -103,12 +150,21 @@ grep -Fq "keep.example.com" "$without_stream" || fail "unrelated site removed"
 legacy="$TEST_TMP/legacy"
 cat > "$legacy" <<'EOF'
 legacy.example.com {
+    log {
+        output file /var/log/caddy/legacy-access.log
+        format json
+    }
+
     reverse_proxy https://upstream.example.com {
         header_up Host {upstream_hostport}
     }
 }
 
 keep.example.com {
+    log keep_log {
+        output file /var/log/caddy/keep-access.log
+    }
+
     reverse_proxy 127.0.0.1:8096
 }
 EOF
@@ -117,6 +173,35 @@ without_legacy="$TEST_TMP/without-legacy"
 remove_site_block_file "$legacy" "$without_legacy" "legacy.example.com" || fail "legacy removal failed"
 ! grep -Fq "legacy.example.com" "$without_legacy" || fail "legacy block remained"
 grep -Fq "keep.example.com" "$without_legacy" || fail "next block was damaged"
+
+diagnostic="$TEST_TMP/diagnostic"
+inject_discovery_log_file "$legacy" "$diagnostic" "legacy" \
+    "legacy.example.com" "legacy.example.com" "/var/log/caddy-emby-pro/test.json" \
+    || fail "discovery log injection failed"
+assert_contains "$(<"$diagnostic")" 'log discover_stream_address {'
+assert_contains "$(<"$diagnostic")" 'output file /var/log/caddy-emby-pro/test.json {'
+[[ "$(grep -Fc 'log discover_stream_address {' "$diagnostic")" == 1 ]] \
+    || fail "discovery log was not injected exactly once"
+! grep -Fq '/var/log/caddy/legacy-access.log' "$diagnostic" \
+    || fail "existing target access log was not removed from diagnostic candidate"
+grep -Fq '/var/log/caddy/keep-access.log' "$diagnostic" \
+    || fail "unrelated site access log was removed from diagnostic candidate"
+
+discovery_log="$TEST_TMP/discovery.json"
+cat > "$discovery_log" <<'EOF'
+{"status":302,"resp_headers":{"Location":["https://STREAM-A.example.com/video/a.mkv?sig=secret"]}}
+{"status":302,"resp_headers":{"Location":["https://stream-a.example.com/video/b.mkv?sig=secret"]}}
+{"status":302,"resp_headers":{"Location":["https://player.example.com/__player_stream/video"]}}
+{"status":302,"resp_headers":{"Location":["https://compat.example.com/emby/video"]}}
+{"status":200,"resp_headers":{}}
+EOF
+[[ "$(discover_origins_from_log "$discovery_log" "player.example.com,compat.example.com")" \
+    == 'https://stream-a.example.com' ]] || fail "stream origin discovery failed"
+[[ "$(merge_stream_upstream_lists \
+    'https://stream-a.example.com:443' \
+    'https://stream-a.example.com,https://stream-b.example.com:443')" \
+    == 'https://stream-a.example.com:443,https://stream-b.example.com:443' ]] \
+    || fail "stream upstream merge failed"
 
 broken="$TEST_TMP/broken"
 printf '%s\n' "$STREAM_BEGIN dao.example.com db.example.com" > "$broken"
@@ -436,19 +521,21 @@ prune_old_backups
 backup_count="$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'Caddyfile.*.bak' | wc -l)"
 (( backup_count == 5 )) || fail "backup pruning did not keep exactly five files"
 
-reset_transaction_case "dangling-symlink"
-rm -f "$CADDYFILE"
-ln -s "$CADDY_DIR/missing-target" "$CADDYFILE"
-symlink_candidate="$(new_candidate_file)"
-printf '%s\n' 'new.example.com {' '    respond "new"' '}' > "$symlink_candidate"
-MOCK_ACTIVE=false
-if apply_candidate "$symlink_candidate"; then
-    fail "dangling Caddyfile symlink was overwritten"
-else
-    apply_status=$?
+if command -v ln >/dev/null 2>&1; then
+    reset_transaction_case "dangling-symlink"
+    rm -f "$CADDYFILE"
+    ln -s "$CADDY_DIR/missing-target" "$CADDYFILE"
+    symlink_candidate="$(new_candidate_file)"
+    printf '%s\n' 'new.example.com {' '    respond "new"' '}' > "$symlink_candidate"
+    MOCK_ACTIVE=false
+    if apply_candidate "$symlink_candidate"; then
+        fail "dangling Caddyfile symlink was overwritten"
+    else
+        apply_status=$?
+    fi
+    (( apply_status != 0 )) || fail "dangling symlink rejection returned zero"
+    [[ -L "$CADDYFILE" ]] || fail "dangling Caddyfile symlink was changed"
 fi
-(( apply_status != 0 )) || fail "dangling symlink rejection returned zero"
-[[ -L "$CADDYFILE" ]] || fail "dangling Caddyfile symlink was changed"
 
 reset_transaction_case "propagate-failure"
 rm -f "$CADDYFILE"
