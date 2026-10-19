@@ -43,17 +43,6 @@ build_stream_config_block \
     "__dao_stream" \
     "$site_id" > "$CADDYFILE"
 
-{
-    printf '\n'
-    build_stream_config_block 'scoped.example.com' 'scoped-line.example.com' \
-        'https://api.example.org' 'https://edge.media.example.net,https://download.example.org' \
-        '__scoped_stream' 'test_scoped' 'media.example.net'
-    printf '\n'
-    build_stream_config_block 'direct.example.com' 'direct-line.example.com' \
-        'https://api.example.org' 'https://download.example.org' \
-        '__direct_stream' 'test_direct' 'media.example.net'
-} >> "$CADDYFILE"
-
 caddy fmt --overwrite "$CADDYFILE"
 caddy validate --config "$CADDYFILE" --adapter caddyfile
 
@@ -91,8 +80,6 @@ runtime_caddyfile="$TEST_TMP/Caddyfile.runtime"
 runtime_log="$TEST_TMP/caddy-runtime.log"
 second_prefix="$(stream_route_prefix '__dao_stream' 1 'localhost')"
 auto_second_prefix="$(stream_route_prefix '__player_stream' 1 'localhost')"
-direct_location='https://download.example.org/video%2Fpart.mkv?sig=a%2Bb%3D&token=x%26y'
-other_location='https://media.example.net.example.com/video.mkv?sig=unchanged'
 
 {
     printf '%s\n' '{' '    admin off' '}' ''
@@ -117,36 +104,13 @@ other_location='https://media.example.net.example.com/video.mkv?sig=unchanged'
         | sed \
             -e "s/^player[.]example[.]com {/http:\/\/player.example.com:$proxy_port {/" \
             -e 's#https://{http.request.host}/#http://{http.request.host}/#g'
-    printf '\n'
-    # Generate a generic per-site policy, then use loopback servers as transports.
-    # No request is ever sent to the external domains in Location headers.
-    build_stream_config_block 'scoped.example.com' 'scoped-line.example.com' \
-        'https://api.example.org' 'https://edge.media.example.net,https://download.example.org' \
-        '__scoped_stream' 'test_scoped' 'media.example.net' \
-        | sed \
-            -e "s/^scoped[.]example[.]com {/http:\/\/scoped.example.com:$proxy_port {/" \
-            -e "s/^scoped-line[.]example[.]com {/http:\/\/scoped-line.example.com:$proxy_port {/" \
-            -e "s#reverse_proxy https://api[.]example[.]org {#reverse_proxy http://127.0.0.1:$api_port {#" \
-            -e "s#reverse_proxy https://edge[.]media[.]example[.]net {#reverse_proxy http://127.0.0.1:$stream_port {#" \
-            -e 's/header_up Host api[.]example[.]org/header_up Host 127.0.0.1/' \
-            -e 's/header_up Host edge[.]media[.]example[.]net/header_up Host 127.0.0.1/' \
-            -e 's#https://{http.request.host}/#http://{http.request.host}/#g'
     printf '\nhttp://127.0.0.1:%s {\n' "$api_port"
     printf '    @stream_a path /redirect/a\n'
     printf '    redir @stream_a "http://127.0.0.1:%s/stream/a.mkv?sig=a" 302\n' "$stream_port"
     printf '    @stream_b path /redirect/b\n'
     printf '    redir @stream_b "http://localhost:%s/stream/b.mkv?sig=b" 302\n' "$stream_b_port"
-    printf '    @scoped path /redirect/scoped\n'
-    printf '    redir @scoped "https://edge.media.example.net/redirect/direct?source=scoped" 302\n'
-    printf '    @direct path /redirect/direct\n'
-    printf '    redir @direct "%s" 302\n' "$direct_location"
-    printf '    @other path /redirect/other\n'
-    printf '    redir @other "%s" 302\n' "$other_location"
     printf '    respond "api {http.request.uri}"\n}\n'
-    printf '\nhttp://127.0.0.1:%s {\n' "$stream_port"
-    printf '    @direct path /redirect/direct\n'
-    printf '    redir @direct "%s" 302\n' "$direct_location"
-    printf '    respond "stream-a {http.request.uri} range={http.request.header.Range}"\n}\n'
+    printf '\nhttp://127.0.0.1:%s {\n    respond "stream-a {http.request.uri} range={http.request.header.Range}"\n}\n' "$stream_port"
     printf '\nhttp://localhost:%s {\n' "$stream_b_port"
     printf '    @hop path /hop-to-a\n'
     printf '    redir @hop "http://127.0.0.1:%s/stream/final.mkv?sig=chain" 302\n' "$stream_port"
@@ -258,29 +222,6 @@ grep -Eq '^HTTP/[0-9.]+ 308' <<< "$redirect_headers" \
     || fail "compatibility path root did not return HTTP 308"
 grep -Fqi 'location: /db.example.com/' <<< "$redirect_headers" \
     || fail "compatibility path root redirect target is incorrect"
-
-for scoped_domain in scoped.example.com scoped-line.example.com; do
-    scoped_resolve="$scoped_domain:$proxy_port:127.0.0.1"
-    for direct_path in /redirect/direct /__scoped_stream/redirect/direct; do
-        scoped_headers="$(curl -sS --noproxy '*' --resolve "$scoped_resolve" \
-            --max-redirs 0 -D - -o /dev/null \
-            "http://$scoped_domain:$proxy_port$direct_path" | tr -d '\r')"
-        grep -Eq '^HTTP/[0-9.]+ 302' <<< "$scoped_headers" \
-            || fail "scoped direct response did not preserve HTTP 302"
-        grep -Fqx "Location: $direct_location" <<< "$scoped_headers" \
-            || fail "scoped proxy rewrote the external Location path, signature, or query"
-    done
-    scoped_headers="$(curl -sS --noproxy '*' --resolve "$scoped_resolve" \
-        --max-redirs 0 -D - -o /dev/null \
-        "http://$scoped_domain:$proxy_port/redirect/scoped" | tr -d '\r')"
-    grep -Fqi "location: http://$scoped_domain/__scoped_stream/redirect/direct?source=scoped" \
-        <<< "$scoped_headers" || fail "scoped proxy no longer rewrites a configured matching node"
-    scoped_headers="$(curl -sS --noproxy '*' --resolve "$scoped_resolve" \
-        --max-redirs 0 -D - -o /dev/null \
-        "http://$scoped_domain:$proxy_port/redirect/other" | tr -d '\r')"
-    grep -Fqx "Location: $other_location" <<< "$scoped_headers" \
-        || fail "a misleading hostname suffix was incorrectly treated as an allowed subdomain"
-done
 
 kill "$CADDY_TEST_PID" 2>/dev/null || true
 wait "$CADDY_TEST_PID" 2>/dev/null || true

@@ -158,64 +158,6 @@ extract_url_host() {
 }
 
 
-normalize_proxy_domains() {
-    local input domain
-    local -a domains=() normalized=()
-    [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]] || return 1
-    input="$(trim_whitespace "$1")"
-    [[ -n "$input" && "$input" != '*' ]] || return 0
-    [[ "$input" != *, ]] || return 1
-    IFS=',' read -r -a domains <<< "$input"
-    for domain in "${domains[@]}"; do
-        domain="$(trim_whitespace "$domain")"
-        domain="${domain,,}"
-        domain="${domain%.}"
-        validate_domain "$domain" || return 1
-        normalized+=("$domain")
-    done
-    (IFS=','; printf '%s\n' "${normalized[*]}")
-}
-
-
-upstream_matches_proxy_domains() {
-    local upstream="$1" proxy_domains="$2" host domain
-    local -a domains=()
-    validate_upstream_url "$upstream" || return 1
-    [[ -n "$proxy_domains" ]] || return 0
-    host="$(extract_url_host "$upstream")"
-    host="${host,,}"
-    host="${host%.}"
-    IFS=',' read -r -a domains <<< "$proxy_domains"
-    for domain in "${domains[@]}"; do
-        [[ "$host" != "$domain" && "$host" != *."$domain" ]] || return 0
-    done
-    return 1
-}
-
-
-filter_stream_upstreams() {
-    local proxy_domains input="$2" selection="${3:-proxy}"
-    local item disposition
-    local -a items=() selected=()
-
-    [[ "$selection" == "proxy" || "$selection" == "direct" ]] || return 1
-    proxy_domains="$(normalize_proxy_domains "$1")" || return 1
-    IFS=',' read -r -a items <<< "$input"
-    for item in "${items[@]}"; do
-        item="$(trim_whitespace "$item")"
-        [[ -n "$item" ]] || continue
-        item="${item%/}"
-        validate_upstream_url "$item" || return 1
-        disposition=proxy
-        if ! upstream_matches_proxy_domains "$item" "$proxy_domains"; then
-            disposition=direct
-        fi
-        [[ "$disposition" != "$selection" ]] || selected+=("$item")
-    done
-    (IFS=','; printf '%s\n' "${selected[*]}")
-}
-
-
 trim_whitespace() {
     local value="$1"
     value="${value#"${value%%[![:space:]]*}"}"
@@ -1102,14 +1044,11 @@ build_stream_config_block() {
     local stream_upstream_list="$4"
     local stream_prefix="$5"
     local site_id="$6"
-    local proxy_domains
     local api_host stream_host route_prefix snippet_name
     local index target_index
     local -a stream_upstreams=() stream_hosts=() stream_regexes=()
     local -a route_prefixes=() snippet_names=()
 
-    proxy_domains="$(normalize_proxy_domains "${7:-}")" || return 1
-    stream_upstream_list="$(merge_stream_upstream_lists "" "$stream_upstream_list" "$proxy_domains")" || return 1
     api_host="$(extract_url_host "$api_upstream")"
     IFS=',' read -r -a stream_upstreams <<< "$stream_upstream_list"
     for index in "${!stream_upstreams[@]}"; do
@@ -1126,9 +1065,6 @@ build_stream_config_block() {
     done
 
     printf '%s\n' "$STREAM_BEGIN $front_domain $route_domain"
-    if [[ -n "$proxy_domains" ]]; then
-        printf '# CADDY_EMBY_PROXY_DOMAINS %s\n' "$proxy_domains"
-    fi
     printf '(%s_api) {\n' "$site_id"
     printf '    reverse_proxy %s {\n' "$api_upstream"
     printf '        header_up Host %s\n' "$api_host"
@@ -1182,14 +1118,11 @@ build_auto_stream_config_block() {
     local stream_upstream_list="$3"
     local stream_prefix="$4"
     local site_id="$5"
-    local proxy_domains
     local api_host stream_host route_prefix snippet_name
     local index target_index
     local -a stream_upstreams=() stream_hosts=() stream_regexes=()
     local -a route_prefixes=() snippet_names=()
 
-    proxy_domains="$(normalize_proxy_domains "${6:-}")" || return 1
-    stream_upstream_list="$(merge_stream_upstream_lists "" "$stream_upstream_list" "$proxy_domains")" || return 1
     api_host="$(extract_url_host "$api_upstream")"
     IFS=',' read -r -a stream_upstreams <<< "$stream_upstream_list"
     for index in "${!stream_upstreams[@]}"; do
@@ -1206,9 +1139,6 @@ build_auto_stream_config_block() {
     done
 
     printf '%s\n' "$AUTO_STREAM_BEGIN $domain"
-    if [[ -n "$proxy_domains" ]]; then
-        printf '# CADDY_EMBY_PROXY_DOMAINS %s\n' "$proxy_domains"
-    fi
     printf '(%s_api) {\n' "$site_id"
     printf '    reverse_proxy %s {\n' "$api_upstream"
     printf '        header_up Host %s\n' "$api_host"
@@ -1436,7 +1366,6 @@ commit_stream_proxy_config() {
     local stream_upstream_list="$4"
     local stream_prefix="$5"
     local site_id="$6"
-    local proxy_domains="${7:-}"
     local candidate config_block
 
     if ! candidate="$(new_candidate_file)"; then
@@ -1470,11 +1399,7 @@ commit_stream_proxy_config() {
 
     config_block="$(build_stream_config_block \
         "$front_domain" "$route_domain" "$api_upstream" "$stream_upstream_list" \
-        "$stream_prefix" "$site_id" "$proxy_domains")" || {
-        error "生成推流配置失败，正式配置未修改"
-        rm -f -- "$candidate"
-        return 1
-    }
+        "$stream_prefix" "$site_id")"
     if ! append_block_to_file "$candidate" "$config_block"; then
         error "写入候选推流配置失败，正式配置未修改"
         rm -f -- "$candidate"
@@ -1488,8 +1413,7 @@ commit_stream_proxy_config() {
 configure_stream_proxy() {
     local front_domain route_domain api_upstream stream_upstream_input stream_upstream_list
     local stream_prefix default_prefix site_id stream_host api_host upstream
-    local confirm apply_status direct_upstreams
-    local proxy_domains proxy_domains_input default_proxy_domains
+    local confirm apply_status
     local index
     local -a stream_upstreams=() stream_hosts=()
 
@@ -1537,19 +1461,10 @@ configure_stream_proxy() {
         error "推流上游必须是 1-8 个 http:// 或 https:// 域名 URL，不能包含路径或重复主机"
         return 1
     fi
-    default_proxy_domains="$(extract_marked_proxy_domains 'CADDY_EMBY_STREAM' "$front_domain")" || return 1
-    echo -e "可限定哪些域名及其子域名走反代，其他播放跳转直连；例如 pvq.cc 或 example.com,example.net。"
-    read -r -p "5. 反代域名范围（回车沿用，* 表示不限制）[${default_proxy_domains:-*}]: " proxy_domains_input < /dev/tty
-    proxy_domains="$(normalize_proxy_domains "${proxy_domains_input:-$default_proxy_domains}")" || {
-        error "反代域名范围无效：请填写不带协议/路径的域名，多个用逗号分隔，或填写 *"
-        return 1
-    }
-    direct_upstreams="$(filter_stream_upstreams "$proxy_domains" "$stream_upstream_list" direct)" || return 1
-    stream_upstream_list="$(merge_stream_upstream_lists "" "$stream_upstream_list" "$proxy_domains")" || return 1
     IFS=',' read -r -a stream_upstreams <<< "$stream_upstream_list"
 
     default_prefix="$(default_stream_prefix "$front_domain")"
-    read -r -p "6. 内部推流前缀（不含 /）[$default_prefix]: " stream_prefix < /dev/tty
+    read -r -p "5. 内部推流前缀（不含 /）[$default_prefix]: " stream_prefix < /dev/tty
     [[ -z "$stream_prefix" ]] && stream_prefix="$default_prefix"
     stream_prefix="${stream_prefix#/}"
     stream_prefix="${stream_prefix%/}"
@@ -1582,14 +1497,6 @@ configure_stream_proxy() {
     echo -e "兼容路径   : /$route_domain"
     echo -e "备用直连   : https://$route_domain"
     echo -e "API 上游   : $api_upstream"
-    echo -e "反代范围   : ${proxy_domains:-不限制（全部已填节点）}"
-    if [[ -n "$proxy_domains" ]]; then
-        echo -e "分流规则   : 范围内已配置节点反代，其他跳转原样直连"
-        if [[ -n "$direct_upstreams" ]]; then
-            echo -e "以下目标保留 302，不添加推流反代："
-            tr ',' '\n' <<< "$direct_upstreams" | sed 's/^/  - /'
-        fi
-    fi
     echo -e "推流节点数 : ${#stream_upstreams[@]}"
     for index in "${!stream_upstreams[@]}"; do
         echo -e "节点 $((index + 1))      : ${stream_upstreams[$index]}"
@@ -1600,12 +1507,12 @@ configure_stream_proxy() {
     else
         echo -e "写入方式   : 追加新的推流组"
     fi
-    read -r -p "7. 确认写入？[y/N]: " confirm < /dev/tty
+    read -r -p "6. 确认写入？[y/N]: " confirm < /dev/tty
     [[ "$confirm" =~ ^[Yy]$ ]] || { warn "已取消"; return 0; }
 
     if commit_stream_proxy_config \
         "$front_domain" "$route_domain" "$api_upstream" "$stream_upstream_list" \
-        "$stream_prefix" "$site_id" "$proxy_domains"; then
+        "$stream_prefix" "$site_id"; then
         echo -e "\n${GREEN}客户端/播放器填写：${PLAIN}"
         echo -e "地址：https://$front_domain"
         echo -e "端口：443"
@@ -1708,21 +1615,6 @@ extract_marked_stream_prefix() {
 }
 
 
-extract_marked_proxy_domains() {
-    local marker="$1" key="$2" proxy_domains
-    [[ -f "$CADDYFILE" ]] || return 0
-    proxy_domains="$(awk -v marker="$marker" -v key="$key" '
-        $1 == "#" && $2 == "BEGIN" && $3 == marker && $4 == key { inside=1; next }
-        inside && $1 == "#" && $2 == "END" && $3 == marker && $4 == key { exit }
-        inside && $1 == "#" && $2 == "CADDY_EMBY_PROXY_DOMAINS" {
-            if (NF != 3 || seen++) exit 42
-            print $3
-        }
-    ' "$CADDYFILE")" || return 1
-    normalize_proxy_domains "$proxy_domains"
-}
-
-
 extract_legacy_reverse_proxies() {
     local domain="$1"
 
@@ -1748,17 +1640,14 @@ extract_discovery_metadata() {
     local key="$2"
     local route="$3"
     local -a proxies=()
-    DISCOVERY_PROXY_DOMAINS=""
 
     case "$type" in
         stream)
             mapfile -t proxies < <(extract_marked_reverse_proxies "CADDY_EMBY_STREAM" "$key")
-            DISCOVERY_PROXY_DOMAINS="$(extract_marked_proxy_domains 'CADDY_EMBY_STREAM' "$key")" || return 1
             DISCOVERY_ROUTE_DOMAIN="$route"
             ;;
         auto)
             mapfile -t proxies < <(extract_marked_reverse_proxies "CADDY_EMBY_AUTO_STREAM" "$key")
-            DISCOVERY_PROXY_DOMAINS="$(extract_marked_proxy_domains 'CADDY_EMBY_AUTO_STREAM' "$key")" || return 1
             DISCOVERY_ROUTE_DOMAIN=""
             ;;
         managed)
@@ -1882,13 +1771,10 @@ inject_discovery_log_file() {
 merge_stream_upstream_lists() {
     local existing="$1"
     local discovered="$2"
-    local proxy_domains input item normalized host seen_host
+    local item normalized host seen_host
     local -a items=() merged=() seen=()
 
-    input="${existing:+$existing,}$discovered"
-    proxy_domains="$(normalize_proxy_domains "${3:-}")" || return 1
-    input="$(filter_stream_upstreams "$proxy_domains" "$input")" || return 1
-    IFS=',' read -r -a items <<< "$input"
+    IFS=',' read -r -a items <<< "${existing:+$existing,}$discovered"
     for item in "${items[@]}"; do
         [[ -n "$item" ]] || continue
         normalized="$(trim_whitespace "$item")"
@@ -1906,11 +1792,7 @@ merge_stream_upstream_lists() {
         merged+=("$normalized")
         (( ${#merged[@]} <= 8 )) || return 1
     done
-    if (( ${#merged[@]} == 0 )); then
-        # A scoped group with no matching nodes still serves its API and preserves 302s.
-        [[ -n "$proxy_domains" ]] || return 1
-        return 0
-    fi
+    (( ${#merged[@]} > 0 )) || return 1
     (IFS=','; printf '%s\n' "${merged[*]}")
 }
 
@@ -1966,7 +1848,6 @@ commit_discovered_stream_proxy_config() {
     local stream_upstream_list="$5"
     local stream_prefix="$6"
     local site_id="$7"
-    local proxy_domains="${8:-}"
     local candidate config_block
 
     candidate="$(new_candidate_file)" || return 1
@@ -2015,11 +1896,7 @@ commit_discovered_stream_proxy_config() {
     fi
     config_block="$(build_stream_config_block \
         "$front_domain" "$route_domain" "$api_upstream" "$stream_upstream_list" \
-        "$stream_prefix" "$site_id" "$proxy_domains")" || {
-        error "生成推流配置失败，正式配置未修改"
-        rm -f -- "$candidate"
-        return 1
-    }
+        "$stream_prefix" "$site_id")"
     append_block_to_file "$candidate" "$config_block" || {
         rm -f -- "$candidate"
         return 1
@@ -2031,8 +1908,6 @@ commit_discovered_stream_proxy_config() {
 find_stream_address() {
     local selection index=-1 i selected_type selected_key selected_domain selected_route
     local discovered merged confirm site_id restore_status=0 target_route_domain conflict_status
-    local direct_upstreams existing_direct_upstreams
-    local proxy_domains proxy_domains_input
 
     echo -e "------------------------------------------------"
     echo -e "${SKYBLUE}查找推流地址并升级当前站点${PLAIN}"
@@ -2103,8 +1978,8 @@ find_stream_address() {
         trap - INT TERM
         return 1
     fi
-    echo -e "\n${YELLOW}请在客户端选择 https://$selected_domain 并重新开始播放。${PLAIN}"
-    echo -e "播放成功或失败都可以；请尝试不同来源的视频，完成后回到这里按回车。"
+    echo -e "\n${YELLOW}请在客户端选择 https://$selected_domain 并播放到失败。${PLAIN}"
+    echo -e "可以连续尝试多个视频；完成后回到这里按回车。"
     read -r -p "准备好后按回车开始分析..." < /dev/tty
 
     discovered="$(discover_origins_from_log "$DISCOVERY_LOG_FILE" \
@@ -2114,38 +1989,16 @@ find_stream_address() {
     (( restore_status == 0 )) || return "$restore_status"
     [[ -n "$discovered" ]] || {
         error "没有捕获到绝对地址形式的 302 推流域名；未覆盖现有站点"
-        warn "请确认重新发起的播放请求经过所选站点；没有 302 不代表播放一定失败"
+        warn "请确认播放操作发生在所选站点，并且确实出现播放失败"
         return 1
     }
-    echo -e "\n${GREEN}发现跳转地址：${PLAIN}"
-    tr ',' '\n' <<< "$discovered" | sed 's/^/  - /'
-    echo -e "可限定哪些域名及其子域名走反代，其他播放跳转直连；例如 pvq.cc 或 example.com,example.net。"
-    read -r -p "反代域名范围（回车沿用，* 表示不限制）[${DISCOVERY_PROXY_DOMAINS:-*}]: " proxy_domains_input < /dev/tty
-    proxy_domains="$(normalize_proxy_domains "${proxy_domains_input:-$DISCOVERY_PROXY_DOMAINS}")" || {
-        error "反代域名范围无效；原有站点未修改"
-        return 1
-    }
-    merged="$(merge_stream_upstream_lists "$DISCOVERY_EXISTING_STREAMS" "$discovered" "$proxy_domains")" || {
+    merged="$(merge_stream_upstream_lists "$DISCOVERY_EXISTING_STREAMS" "$discovered")" || {
         error "发现的节点与现有节点合并失败或超过 8 个；未覆盖现有站点"
         return 1
     }
-    direct_upstreams="$(filter_stream_upstreams "$proxy_domains" "$discovered" direct)" || return 1
-    existing_direct_upstreams="$(filter_stream_upstreams "$proxy_domains" "$DISCOVERY_EXISTING_STREAMS" direct)" || return 1
 
-    if [[ -n "$proxy_domains" ]]; then
-        echo -e "分流规则：$proxy_domains 及其子域名内的已配置节点反代，其他跳转原样直连。"
-        if [[ -n "$direct_upstreams" ]]; then
-            echo -e "本次发现的直连目标（不加入反代）："
-            tr ',' '\n' <<< "$direct_upstreams" | sed 's/^/  - /'
-        fi
-        if [[ -n "$existing_direct_upstreams" ]]; then
-            echo -e "确认覆盖后，将从原反代节点中移除以下直连目标："
-            tr ',' '\n' <<< "$existing_direct_upstreams" | sed 's/^/  - /'
-        elif [[ -z "$merged" ]]; then
-            log "本次仅发现直连目标，无需新增推流反代；原站点未修改"
-            return 0
-        fi
-    fi
+    echo -e "\n${GREEN}发现推流地址：${PLAIN}"
+    tr ',' '\n' <<< "$discovered" | sed 's/^/  - /'
 
     if [[ "$selected_type" == "stream" ]]; then
         target_route_domain="$DISCOVERY_ROUTE_DOMAIN"
@@ -2186,8 +2039,7 @@ find_stream_address() {
     echo -e "客户端入口：https://$selected_key（端口 443，路径留空）"
     echo -e "兼容线路：https://$target_route_domain"
     echo -e "API 上游：$DISCOVERY_API_UPSTREAM"
-    echo -e "反代范围：${proxy_domains:-不限制（全部已发现节点）}"
-    echo -e "反代推流上游：${merged:-无（仅保留 API 反代，播放跳转原样直连）}"
+    echo -e "推流上游：$merged"
     echo -e "覆盖前脚本会备份并验证 Caddyfile；其他站点保持不变。"
     read -r -p "确认覆盖并启用推流反代？[y/N]: " confirm < /dev/tty
     [[ "$confirm" =~ ^[Yy]$ ]] || { warn "已取消，原有站点未修改"; return 0; }
@@ -2195,7 +2047,7 @@ find_stream_address() {
     site_id="$(make_site_id "$selected_key")"
     if commit_discovered_stream_proxy_config "$selected_type" "$selected_key" \
         "$target_route_domain" "$DISCOVERY_API_UPSTREAM" "$merged" \
-        "$DISCOVERY_PREFIX" "$site_id" "$proxy_domains"; then
+        "$DISCOVERY_PREFIX" "$site_id"; then
         echo -e "\n${GREEN}客户端/播放器填写：${PLAIN}"
         echo -e "地址：https://$selected_key"
         echo -e "端口：443"
