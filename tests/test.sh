@@ -66,6 +66,93 @@ validate_upstream_url "https://stream.example.com:443" || fail "valid upstream r
 valid_menu_choice 11 || fail "menu choice 11 rejected"
 ! valid_menu_choice 12 || fail "menu choice 12 accepted"
 
+[[ "$(normalize_proxy_domains ' Media.Example.COM., cdn.example.net ')" == 'media.example.com,cdn.example.net' ]] \
+    || fail "proxy domain ranges were not normalized"
+[[ -z "$(normalize_proxy_domains '')" && -z "$(normalize_proxy_domains '*')" ]] \
+    || fail "empty range or explicit unrestricted selection was rejected"
+for invalid_range in 'https://example.com' '*.example.com' 'example.com/path' 'example.com:443' \
+    'example.com,' ',example.com' 'example.com,,example.net' '*,example.com' \
+    $'example.com\nexample.net' $'example.com\r'; do
+    ! normalize_proxy_domains "$invalid_range" >/dev/null || fail "invalid range accepted: $invalid_range"
+done
+for pvq_origin in 'https://pvq.cc' 'https://IRIS.PVQ.CC:443' 'http://edge.stream.pvq.cc:8080' 'https://iris.pvq.cc.'; do
+    upstream_matches_proxy_domains "$pvq_origin" 'pvq.cc' || fail "matching origin was excluded: $pvq_origin"
+done
+for external_origin in 'https://notpvq.cc' 'https://pvq.cc.example.com' 'https://download.115cdn.com' \
+    'https://pvq.cc@external.example.com' 'https://external.example.com/iris.pvq.cc' ''; do
+    ! upstream_matches_proxy_domains "$external_origin" 'pvq.cc' || fail "non-matching origin was included: $external_origin"
+done
+
+scoped_api='https://api.example.org:443'
+scoped_nodes='https://edge.media.example.com:443,https://download.115cdn.com,https://storage.example.com'
+[[ "$(merge_stream_upstream_lists '' "$scoped_nodes" 'media.example.com')" == 'https://edge.media.example.com:443' ]] \
+    || fail "domain policy accepted direct-download hosts as proxy nodes"
+[[ "$(filter_stream_upstreams 'media.example.com' "$scoped_nodes" direct)" \
+    == 'https://download.115cdn.com,https://storage.example.com' ]] \
+    || fail "policy did not classify both known and unknown external targets as direct"
+[[ "$(merge_stream_upstream_lists "$scoped_nodes" 'https://edge.cdn.example.net' 'media.example.com,cdn.example.net')" \
+    == 'https://edge.media.example.com:443,https://edge.cdn.example.net' ]] \
+    || fail "multiple domain ranges failed to filter old nodes and merge new nodes"
+[[ "$(merge_stream_upstream_lists '' "$scoped_nodes")" == "$scoped_nodes" ]] \
+    || fail "unrestricted legacy behavior changed"
+[[ "$(merge_stream_upstream_lists '' "$scoped_nodes" '*')" == "$scoped_nodes" ]] \
+    || fail "explicit unrestricted policy still excluded nodes"
+[[ -z "$(merge_stream_upstream_lists '' 'https://download.115cdn.com' 'media.example.com')" ]] \
+    || fail "scoped direct-only discovery should succeed with zero proxy nodes"
+many_direct_nodes='https://edge.media.example.com'
+for index in {1..10}; do many_direct_nodes+=",https://download${index}.example.com"; done
+[[ "$(merge_stream_upstream_lists '' "$many_direct_nodes" 'media.example.com')" == 'https://edge.media.example.com' ]] \
+    || fail "direct-download hosts incorrectly counted against the proxy-node limit"
+! merge_stream_upstream_lists '' "$many_direct_nodes" >/dev/null || fail "unrestricted node limit was bypassed"
+
+scoped_block="$(build_stream_config_block 'scoped.example.com' 'line.example.com' \
+    "$scoped_api" "$scoped_nodes" '__scoped_stream' 'test_scoped' 'media.example.com')"
+assert_contains "$scoped_block" 'reverse_proxy https://edge.media.example.com:443'
+assert_contains "$scoped_block" '# CADDY_EMBY_PROXY_DOMAINS media.example.com'
+! grep -Eq '115cdn|storage[.]example' <<< "$scoped_block" \
+    || fail "scoped generator installed a direct-download proxy or rewrite"
+scoped_direct_block="$(build_stream_config_block 'scoped.example.com' 'line.example.com' \
+    "$scoped_api" 'https://download.115cdn.com' '__scoped_stream' 'test_scoped' 'media.example.com')"
+assert_contains "$scoped_direct_block" "reverse_proxy $scoped_api"
+assert_contains "$scoped_direct_block" 'handle_path /line.example.com/*'
+! grep -Eq 'header_down Location|115cdn|handle_path /__scoped_stream' <<< "$scoped_direct_block" \
+    || fail "direct-only scoped configuration retained a stream rewrite"
+unrestricted_block="$(build_stream_config_block 'unrestricted.example.com' 'legacy-line.example.com' \
+    'https://iris.pvq.cc' "$scoped_nodes" '__legacy_stream' 'test_legacy')"
+assert_contains "$unrestricted_block" 'reverse_proxy https://download.115cdn.com'
+! grep -Fq 'CADDY_EMBY_PROXY_DOMAINS' <<< "$unrestricted_block" \
+    || fail "API hostname silently enabled a domain policy"
+
+printf '%s\n%s\n' "$scoped_block" "$unrestricted_block" > "$CADDYFILE"
+extract_discovery_metadata stream 'scoped.example.com' 'line.example.com' || fail "scoped metadata read failed"
+[[ "$DISCOVERY_PROXY_DOMAINS" == 'media.example.com' ]] || fail "saved policy was not read for rediscovery"
+[[ "$DISCOVERY_EXISTING_STREAMS" == 'https://edge.media.example.com:443' ]] || fail "wrong saved stream nodes"
+extract_discovery_metadata stream 'unrestricted.example.com' 'legacy-line.example.com' || fail "legacy metadata read failed"
+[[ -z "$DISCOVERY_PROXY_DOMAINS" ]] || fail "policy leaked between sites"
+second_scoped_block="$(build_stream_config_block 'second.example.com' 'second-line.example.com' \
+    "$scoped_api" "$scoped_nodes" '__second_stream' 'test_second' 'storage.example.com')"
+assert_contains "$second_scoped_block" 'reverse_proxy https://storage.example.com'
+! grep -Fq 'reverse_proxy https://edge.media.example.com' <<< "$second_scoped_block" \
+    || fail "second provider inherited the first provider's policy"
+printf '%s\n' "$second_scoped_block" >> "$CADDYFILE"
+[[ "$(extract_marked_proxy_domains CADDY_EMBY_STREAM scoped.example.com)" == 'media.example.com' ]] \
+    || fail "second site's metadata changed the first site's policy"
+[[ "$(extract_marked_proxy_domains CADDY_EMBY_STREAM second.example.com)" == 'storage.example.com' ]] \
+    || fail "second site's policy was not stored independently"
+cleared_block="$(build_stream_config_block 'scoped.example.com' 'line.example.com' \
+    "$scoped_api" "$scoped_nodes" '__scoped_stream' 'test_scoped' '*')"
+assert_contains "$cleared_block" 'reverse_proxy https://download.115cdn.com'
+! grep -Fq 'CADDY_EMBY_PROXY_DOMAINS' <<< "$cleared_block" || fail "cleared policy persisted in generated config"
+build_auto_stream_config_block 'auto.example.com' "$scoped_api" "$scoped_nodes" \
+    '__auto_stream' 'test_auto_scoped' 'media.example.com' > "$CADDYFILE"
+extract_discovery_metadata auto 'auto.example.com' '' || fail "auto policy read failed"
+[[ "$DISCOVERY_PROXY_DOMAINS" == 'media.example.com' ]] || fail "auto migration lost its policy"
+printf '%s\n' "$STREAM_BEGIN bad.example.com bad-line.example.com" \
+    '# CADDY_EMBY_PROXY_DOMAINS media.example.com' '# CADDY_EMBY_PROXY_DOMAINS cdn.example.net' \
+    "$STREAM_END bad.example.com" > "$CADDYFILE"
+! extract_marked_proxy_domains CADDY_EMBY_STREAM bad.example.com >/dev/null || fail "duplicate policy accepted"
+rm -f "$CADDYFILE"
+
 site_id="$(make_site_id "dao.example.com")"
 [[ "$site_id" == "$(make_site_id "dao.example.com")" ]] || fail "site id is not stable"
 
@@ -567,6 +654,37 @@ grep -Fq "$STREAM_BEGIN player.example.com line.example.com" "$CAPTURED_CANDIDAT
     || fail "discovered-site migration did not create a standard dual-domain stream group"
 ! grep -Fq "$SITE_BEGIN player.example.com" "$CAPTURED_CANDIDATE" \
     || fail "discovered-site migration retained the old ordinary site block"
+
+reset_transaction_case "cleanup-existing-direct-nodes"
+# A new explicit policy removes an old node without changing other sites.
+build_stream_config_block 'scoped.example.com' 'line.example.com' "$scoped_api" \
+    'https://download.115cdn.com' '__scoped_stream' 'test_scoped' > "$CADDYFILE"
+printf '\n%s\n' "$block" >> "$CADDYFILE"
+if commit_discovered_stream_proxy_config 'stream' 'scoped.example.com' 'line.example.com' \
+    "$scoped_api" 'https://download.115cdn.com' '__scoped_stream' 'test_scoped' 'media.example.com'; then
+    fail "scoped cleanup swallowed apply failure"
+else
+    apply_status=$?
+fi
+(( apply_status == 37 )) || fail "scoped cleanup did not reach the transaction apply step"
+! grep -Fq '115cdn' "$CAPTURED_CANDIDATE" || fail "scoped cleanup retained the old direct-download proxy"
+grep -Fq "$STREAM_BEGIN scoped.example.com line.example.com" "$CAPTURED_CANDIDATE" \
+    || fail "scoped cleanup lost the dual-domain site"
+grep -Fq '# CADDY_EMBY_PROXY_DOMAINS media.example.com' "$CAPTURED_CANDIDATE" \
+    || fail "scoped cleanup lost the domain policy"
+grep -Fq "$STREAM_BEGIN dao.example.com db.example.com" "$CAPTURED_CANDIDATE" \
+    || fail "scoped cleanup removed an unrelated provider"
+
+reset_transaction_case "invalid-domain-policy"
+printf '%s\n' "$block" > "$CADDYFILE"
+original_config="$(<"$CADDYFILE")"
+CAPTURED_CANDIDATE=""
+if commit_stream_proxy_config 'scoped.example.com' 'line.example.com' "$scoped_api" \
+    "$scoped_nodes" '__scoped_stream' 'test_scoped' 'https://invalid.example.com'; then
+    fail "invalid domain policy was committed"
+fi
+[[ -z "$CAPTURED_CANDIDATE" ]] || fail "invalid policy reached apply_candidate"
+[[ "$(<"$CADDYFILE")" == "$original_config" ]] || fail "invalid policy modified the original file"
 
 reset_transaction_case "propagate-failure"
 rm -f "$CADDYFILE"
