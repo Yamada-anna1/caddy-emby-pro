@@ -9,17 +9,57 @@ permissions:
 
 jobs:
   validate:
+    name: Validate (Caddy ${{ matrix.caddy }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # SHA256 digests from the official GitHub release asset metadata.
+        include:
+          - caddy: '2.10.2'
+            sha256: '5c218bc34c9197369263da7e9317a83acdbd80ef45d94dca5eff76e727c67cdd'
+          - caddy: '2.11.4'
+            sha256: '527fbf917c39189a1e3b31d34fa955601680b2d5c8055d2a87b8b9588dec7bb9'
     steps:
       - uses: actions/checkout@v5
       - name: Install test dependencies
+        timeout-minutes: 4
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y shellcheck jq
-          curl -fsSL --retry 3 \
-            'https://caddyserver.com/api/download?os=linux&arch=amd64' \
-            -o /tmp/caddy
-          sudo install -m 0755 /tmp/caddy /usr/local/bin/caddy
+          if ! command -v shellcheck >/dev/null || ! command -v jq >/dev/null; then
+            sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+            sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y shellcheck jq
+          fi
+          shellcheck --version
+          jq --version
+      - name: Install verified Caddy release
+        timeout-minutes: 7
+        shell: bash
+        env:
+          CADDY_VERSION: ${{ matrix.caddy }}
+          CADDY_SHA256: ${{ matrix.sha256 }}
+        run: |
+          caddy_download_dir="$(mktemp -d "$RUNNER_TEMP/caddy-${CADDY_VERSION}.XXXXXX")"
+          caddy_archive="caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
+          caddy_checksums="caddy_${CADDY_VERSION}_checksums.txt"
+          caddy_release_url="https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}"
+          for caddy_asset in "$caddy_archive" "$caddy_checksums"; do
+            printf 'Downloading Caddy %s: %s\n' "$CADDY_VERSION" "$caddy_asset"
+            curl -fsSL --proto '=https' --connect-timeout 15 --max-time 60 \
+              --retry 2 --retry-delay 2 --retry-max-time 180 --retry-all-errors \
+              "$caddy_release_url/$caddy_asset" -o "$caddy_download_dir/$caddy_asset"
+          done
+          awk -v archive="$caddy_archive" \
+            '$2 == archive {print; count++} END {if (count != 1) exit 1}' \
+            "$caddy_download_dir/$caddy_checksums" > "$caddy_download_dir/caddy.sha512"
+          # Caddy's official checksums manifest uses SHA512, not SHA256.
+          (cd "$caddy_download_dir" && sha512sum --check --strict caddy.sha512)
+          printf '%s  %s\n' "$CADDY_SHA256" "$caddy_archive" > "$caddy_download_dir/caddy.sha256"
+          (cd "$caddy_download_dir" && sha256sum --check --strict caddy.sha256)
+          tar -xzf "$caddy_download_dir/$caddy_archive" -C "$caddy_download_dir" caddy
+          sudo install -m 0755 "$caddy_download_dir/caddy" /usr/local/bin/caddy
+          caddy version
       - name: Bash syntax
         run: bash -n install_caddy_emby.sh tests/test.sh tests/caddy_integration.sh
       - name: ShellCheck
