@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ====================================================
-#  Caddy Reverse Proxy for Emby - V6 Pro
+#  Caddy Reverse Proxy for Emby - V6.1 Pro
 #  Original author: AiLi1337
 #  Multi-site stream proxy extension: Yamada-anna1
 # ====================================================
@@ -12,6 +12,7 @@ YELLOW='\033[0;33m'
 SKYBLUE='\033[0;36m'
 PLAIN='\033[0m'
 
+SCRIPT_VERSION="V6.1 Pro"
 SCRIPT_URL="https://raw.githubusercontent.com/Yamada-anna1/caddy-emby-pro/main/install_caddy_emby.sh"
 SCRIPT_DEST="/usr/local/bin/caddy_emby.sh"
 SHORTCUT="/usr/local/bin/c"
@@ -1081,12 +1082,10 @@ build_standard_config_block() {
 $SITE_BEGIN $domain
 $domain {
     encode gzip
-    header Access-Control-Allow-Origin *
+    header ?Access-Control-Allow-Origin *
 
     reverse_proxy $backend {
         header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-For {remote_host}
-        header_up X-Forwarded-Proto {scheme}
         header_up Host {upstream_hostport}
     }
 }
@@ -1162,7 +1161,13 @@ build_stream_config_block() {
 
     printf '\n%s {\n' "$front_domain"
     printf '    @route_root path /%s\n' "$route_domain"
-    printf '    redir @route_root /%s/ 308\n\n' "$route_domain"
+    # Match before the API fallback; keep rewrite before redir inside route.
+    printf '    handle @route_root {\n'
+    printf '        route {\n'
+    printf '            rewrite * /%s/\n' "$route_domain"
+    printf '            redir {uri} 308\n'
+    printf '        }\n'
+    printf '    }\n\n'
     printf '    handle_path /%s/* {\n' "$route_domain"
     printf '        import %s_api\n' "$site_id"
     printf '    }\n\n'
@@ -2441,7 +2446,7 @@ show_menu() {
     local num
     clear
     echo -e "############################################################"
-    echo -e "#   Caddy + Emby 多站点及推流管理脚本 (V6 Pro)            #"
+    echo -e "#   Caddy + Emby 多站点及推流管理脚本 ($SCRIPT_VERSION)            #"
     echo -e "############################################################"
     echo -e " ${GREEN}1.${PLAIN} 安装环境 & Caddy"
     echo -e " ${GREEN}2.${PLAIN} 添加/覆盖 普通反代配置（支持多站）"

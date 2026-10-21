@@ -96,6 +96,9 @@ other_location='https://media.example.net.example.com/video.mkv?sig=unchanged'
 
 {
     printf '%s\n' '{' '    admin off' '}' ''
+    build_standard_config_block "standard.example.com" "http://127.0.0.1:$api_port" \
+        | sed -e "s/^standard[.]example[.]com {/http:\/\/standard.example.com:$proxy_port {/"
+    printf '\n'
     build_stream_config_block \
         "dao.example.com" \
         "db.example.com" \
@@ -142,6 +145,17 @@ other_location='https://media.example.net.example.com/video.mkv?sig=unchanged'
     printf '    redir @direct "%s" 302\n' "$direct_location"
     printf '    @other path /redirect/other\n'
     printf '    redir @other "%s" 302\n' "$other_location"
+    printf '    @cors_wildcard path /headers/wildcard\n'
+    printf '    header @cors_wildcard Access-Control-Allow-Origin *\n'
+    printf '    @cors_credentials path /headers/credentials\n'
+    printf '    header @cors_credentials {\n'
+    printf '        Access-Control-Allow-Origin https://client.example.com\n'
+    printf '        Access-Control-Allow-Credentials true\n'
+    printf '        Vary Origin\n    }\n'
+    printf '    @header_probe path /headers/*\n'
+    printf '    respond @header_probe "host={http.request.hostport} xff={http.request.header.X-Forwarded-For} xfp={http.request.header.X-Forwarded-Proto}"\n'
+    printf '    @root_post {\n        path /\n        method POST\n    }\n'
+    printf '    respond @root_post "api-post {http.request.uri} method={http.request.method}"\n'
     printf '    respond "api {http.request.uri}"\n}\n'
     printf '\nhttp://127.0.0.1:%s {\n' "$stream_port"
     printf '    @direct path /redirect/direct\n'
@@ -160,6 +174,7 @@ CADDY_TEST_PID=$!
 front_resolve="dao.example.com:$proxy_port:127.0.0.1"
 route_resolve="db.example.com:$proxy_port:127.0.0.1"
 auto_resolve="player.example.com:$proxy_port:127.0.0.1"
+standard_resolve="standard.example.com:$proxy_port:127.0.0.1"
 runtime_ready=false
 for _ in {1..50}; do
     if ! kill -0 "$CADDY_TEST_PID" 2>/dev/null; then
@@ -177,6 +192,39 @@ done
     cat "$runtime_log" >&2
     fail "runtime Caddy did not become ready"
 }
+
+# A generated standard site only supplies the historical wildcard when the
+# upstream has no CORS origin header; it must not append to or override one.
+for cors_case in missing wildcard credentials; do
+    standard_headers="$(curl -fsS --noproxy '*' --resolve "$standard_resolve" \
+        -H 'Origin: https://client.example.com' -D - -o /dev/null \
+        "http://standard.example.com:$proxy_port/headers/$cors_case" | tr -d '\r')"
+    cors_header_count="$(awk 'tolower($1) == "access-control-allow-origin:" {count++} END {print count+0}' \
+        <<< "$standard_headers")"
+    [[ "$cors_header_count" == 1 ]] \
+        || fail "standard proxy did not return exactly one CORS origin header for $cors_case"
+    cors_origin="$(awk 'tolower($1) == "access-control-allow-origin:" {sub(/^[^:]+:[[:space:]]*/, ""); print}' \
+        <<< "$standard_headers")"
+    expected_origin='*'
+    if [[ "$cors_case" == credentials ]]; then
+        expected_origin='https://client.example.com'
+        grep -Fqi 'Access-Control-Allow-Credentials: true' <<< "$standard_headers" \
+            || fail "standard proxy removed the upstream credentials policy"
+        grep -Fqi 'Vary: Origin' <<< "$standard_headers" \
+            || fail "standard proxy removed the upstream Origin cache distinction"
+    fi
+    [[ "$cors_origin" == "$expected_origin" ]] \
+        || fail "standard proxy replaced or corrupted the upstream CORS origin for $cors_case"
+done
+
+# With no trusted_proxies configured, user-supplied XFF/XFP values must not
+# override Caddy's client address or the actual incoming request scheme.
+standard_header_response="$(curl -fsS --noproxy '*' --resolve "$standard_resolve" \
+    -H 'X-Forwarded-For: 198.51.100.25, 203.0.113.5' \
+    -H 'X-Forwarded-Proto: https' \
+    "http://standard.example.com:$proxy_port/headers/missing")"
+[[ "$standard_header_response" == "host=127.0.0.1:$api_port xff=127.0.0.1 xfp=http" ]] \
+    || fail "standard proxy lost its explicit upstream Host or trusted forged forwarding headers"
 
 root_response="$(curl -fsS --noproxy '*' --resolve "$front_resolve" \
     "http://dao.example.com:$proxy_port/emby/System/Info/Public?token=a")"
@@ -256,8 +304,57 @@ redirect_headers="$(curl -sS --noproxy '*' --resolve "$front_resolve" \
     "http://dao.example.com:$proxy_port/db.example.com" | tr -d '\r')"
 grep -Eq '^HTTP/[0-9.]+ 308' <<< "$redirect_headers" \
     || fail "compatibility path root did not return HTTP 308"
-grep -Fqi 'location: /db.example.com/' <<< "$redirect_headers" \
-    || fail "compatibility path root redirect target is incorrect"
+redirect_location="$(awk 'tolower($1) == "location:" {sub(/^[^:]+:[[:space:]]*/, ""); print}' \
+    <<< "$redirect_headers")"
+[[ "$redirect_location" == '/db.example.com/' ]] \
+    || fail "queryless compatibility root redirect changed its target or added a question mark"
+
+redirect_response="$(curl -fsS --noproxy '*' --resolve "$front_resolve" \
+    --location --max-redirs 1 \
+    "http://dao.example.com:$proxy_port/db.example.com")"
+[[ "$redirect_response" == 'api /' ]] \
+    || fail "queryless compatibility root redirect did not reach the API root"
+
+# Compare the exact raw query rather than decoded values: signatures may depend
+# on percent encoding, plus signs, duplicate-key order, and empty/bare values.
+root_query='sig=a%2Bb%26c%3D&name=a+b&dup=first&empty=&dup=second&bare&encoded=%252F'
+redirect_headers="$(curl -sS --noproxy '*' --resolve "$front_resolve" \
+    --max-redirs 0 -D - -o /dev/null \
+    "http://dao.example.com:$proxy_port/db.example.com?$root_query" | tr -d '\r')"
+grep -Eq '^HTTP/[0-9.]+ 308' <<< "$redirect_headers" \
+    || fail "compatibility root with a query did not return HTTP 308"
+redirect_location="$(awk 'tolower($1) == "location:" {sub(/^[^:]+:[[:space:]]*/, ""); print}' \
+    <<< "$redirect_headers")"
+[[ "$redirect_location" == "/db.example.com/?$root_query" ]] \
+    || fail "compatibility root redirect dropped, reordered, or re-encoded the raw query"
+
+# curl --location may uppercase percent escapes while resolving a redirect.
+# Check mixed-case bytes in Location, then replay that literal URL separately
+# so client-side normalization is not mistaken for a Caddy rewrite regression.
+mixed_query="$root_query&lower=%2b%26"
+mixed_headers="$(curl -sS --noproxy '*' --resolve "$front_resolve" \
+    --max-redirs 0 -D - -o /dev/null \
+    "http://dao.example.com:$proxy_port/db.example.com?$mixed_query" | tr -d '\r')"
+mixed_location="$(awk 'tolower($1) == "location:" {sub(/^[^:]+:[[:space:]]*/, ""); print}' \
+    <<< "$mixed_headers")"
+[[ "$mixed_location" == "/db.example.com/?$mixed_query" ]] \
+    || fail "compatibility root redirect normalized percent-escape case"
+mixed_response="$(curl -fsS --noproxy '*' --resolve "$front_resolve" \
+    "http://dao.example.com:$proxy_port$mixed_location")"
+[[ "$mixed_response" == "api /?$mixed_query" ]] \
+    || fail "literal compatibility redirect replay changed the raw query"
+
+redirect_response="$(curl -fsS --noproxy '*' --resolve "$front_resolve" \
+    --location --max-redirs 1 \
+    "http://dao.example.com:$proxy_port/db.example.com?$root_query")"
+[[ "$redirect_response" == "api /?$root_query" ]] \
+    || fail "following the compatibility root redirect changed the query or API root"
+
+redirect_post_response="$(curl -fsS --noproxy '*' --resolve "$front_resolve" \
+    --location --max-redirs 1 --data-binary 'redirect-probe=keep-post' \
+    "http://dao.example.com:$proxy_port/db.example.com?$root_query")"
+[[ "$redirect_post_response" == "api-post /?$root_query method=POST" ]] \
+    || fail "compatibility root HTTP 308 did not preserve POST and the raw query"
 
 for scoped_domain in scoped.example.com scoped-line.example.com; do
     scoped_resolve="$scoped_domain:$proxy_port:127.0.0.1"

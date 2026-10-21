@@ -52,6 +52,13 @@ assert_contains() {
     [[ "$haystack" == *"$needle"* ]] || fail "missing: $needle"
 }
 
+standard_block="$(build_standard_config_block 'ordinary.example.com' 'https://api.example.com:443')"
+assert_contains "$standard_block" 'header ?Access-Control-Allow-Origin *'
+assert_contains "$standard_block" 'header_up Host {upstream_hostport}'
+assert_contains "$standard_block" 'header_up X-Real-IP {remote_host}'
+! grep -Eq 'header_up X-Forwarded-(For|Proto)' <<< "$standard_block" \
+    || fail "ordinary proxy overrides Caddy forwarding-header defaults"
+
 validate_domain "dao.example.com" || fail "valid domain rejected"
 ! validate_domain "https://dao.example.com" || fail "invalid domain accepted"
 validate_upstream_url "https://stream.example.com:443" || fail "valid upstream rejected"
@@ -115,6 +122,13 @@ scoped_direct_block="$(build_stream_config_block 'scoped.example.com' 'line.exam
     "$scoped_api" 'https://download.115cdn.com' '__scoped_stream' 'test_scoped' 'media.example.com')"
 assert_contains "$scoped_direct_block" "reverse_proxy $scoped_api"
 assert_contains "$scoped_direct_block" 'handle_path /line.example.com/*'
+assert_contains "$scoped_direct_block" '    @route_root path /line.example.com
+    handle @route_root {
+        route {
+            rewrite * /line.example.com/
+            redir {uri} 308
+        }
+    }'
 ! grep -Eq 'header_down Location|115cdn|handle_path /__scoped_stream' <<< "$scoped_direct_block" \
     || fail "direct-only scoped configuration retained a stream rewrite"
 unrestricted_block="$(build_stream_config_block 'unrestricted.example.com' 'legacy-line.example.com' \
@@ -172,6 +186,15 @@ assert_contains "$block" 'header_up Host stream.example.com'
 assert_contains "$block" 'header_down Location "(?i)^https?://stream[.]example[.]com(:[0-9]+)?/" "https://{http.request.host}/__dao_stream/"'
 ! grep -Fq '(?:' <<< "$block" \
     || fail "stream Location regex contains a Go-incompatible non-capturing group"
+assert_contains "$block" '    @route_root path /db.example.com
+    handle @route_root {
+        route {
+            rewrite * /db.example.com/
+            redir {uri} 308
+        }
+    }'
+! grep -Fq 'redir @route_root /db.example.com/ 308' <<< "$block" \
+    || fail "compatibility root redirect still discards the original query"
 assert_contains "$block" "    handle_path /db.example.com/* {
         import ${site_id}_api
     }"
@@ -193,6 +216,13 @@ multi_block="$(build_stream_config_block \
     "$site_id")"
 assert_contains "$multi_block" "(${site_id}_stream_1)"
 assert_contains "$multi_block" "(${site_id}_stream_2)"
+assert_contains "$multi_block" '    @route_root path /db.example.com
+    handle @route_root {
+        route {
+            rewrite * /db.example.com/
+            redir {uri} 308
+        }
+    }'
 assert_contains "$multi_block" 'header_down Location "(?i)^https?://stream-a[.]example[.]com(:[0-9]+)?/" "https://{http.request.host}/__dao_stream/"'
 assert_contains "$multi_block" "header_down Location \"(?i)^https?://stream-b[.]example[.]com(:[0-9]+)?/\" \"https://{http.request.host}/$second_prefix/\""
 assert_contains "$multi_block" "    handle_path /__dao_stream/* {
